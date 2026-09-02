@@ -512,6 +512,122 @@ cout << "[WORKER " << threadId
      << endl;
 
 
+     // =================================================
+// RECEIVE RESPONSE FROM DESTINATION SERVER
+// AND FORWARD IT TO CLIENT
+// =================================================
+
+cout << "\n[WORKER " << threadId
+     << "] Waiting for response from destination..."
+     << endl;
+
+
+// Buffer for chunks received from destination
+char responseBuffer[8192];
+
+
+while (true)
+{
+    // =============================================
+    // RECEIVE RESPONSE FROM DESTINATION SERVER
+    // =============================================
+
+    int bytesReceivedFromServer = recv(
+
+        destinationSocket,
+
+        responseBuffer,
+
+        sizeof(responseBuffer),
+
+        0
+
+    );
+
+
+    // Server closed connection
+    if (bytesReceivedFromServer == 0)
+    {
+        cout << "[WORKER " << threadId
+             << "] Destination server closed connection"
+             << endl;
+
+        break;
+    }
+
+
+    // Receive error
+    if (bytesReceivedFromServer == SOCKET_ERROR)
+    {
+        cout << "[WORKER " << threadId
+             << "] Error receiving response from destination"
+             << endl;
+
+        break;
+    }
+
+
+    cout << "[WORKER " << threadId
+         << "] Received "
+         << bytesReceivedFromServer
+         << " bytes from destination"
+         << endl;
+
+
+    // =============================================
+    // FORWARD ENTIRE CHUNK TO CLIENT
+    // =============================================
+
+    int totalSentToClient = 0;
+
+
+    while (totalSentToClient < bytesReceivedFromServer)
+    {
+        int bytesSentToClient = send(
+
+            clientSocket,
+
+            responseBuffer + totalSentToClient,
+
+            bytesReceivedFromServer - totalSentToClient,
+
+            0
+
+        );
+
+
+        if (bytesSentToClient == SOCKET_ERROR)
+        {
+            cout << "[WORKER " << threadId
+                 << "] Failed to forward response to client"
+                 << endl;
+
+            break;
+        }
+
+
+        totalSentToClient += bytesSentToClient;
+    }
+
+
+    cout << "[WORKER " << threadId
+         << "] Response chunk forwarded to client"
+         << endl;
+
+
+    // If sending to client failed,
+    // stop receiving more data.
+    if (totalSentToClient < bytesReceivedFromServer)
+    {
+        break;
+    }
+}
+
+
+cout << "[WORKER " << threadId
+     << "] Response relay finished"
+     << endl;
+
     // =================================================
     // CURRENT TEMPORARY RESPONSE
     //
