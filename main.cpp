@@ -41,18 +41,17 @@ HANDLE emptySlots;
 // HANDLE CLIENT
 // =====================================================
 
-void handleClient(SOCKET clientSocket)
-{
+void handleClient(SOCKET clientSocket) {
+
     DWORD threadId = GetCurrentThreadId();
 
-    cout << "\n=================================" << endl;
-    cout << "[WORKER " << threadId << "] Handling client" << endl;
-    cout << "=================================" << endl;
+    cout << "\n[WORKER " << threadId
+         << "] Handling client" << endl;
 
 
-    // ---------------------------------------------
-    // RECEIVE REQUEST
-    // ---------------------------------------------
+    // ==========================================
+    // RECEIVE REQUEST FROM CLIENT
+    // ==========================================
 
     char buffer[4096];
 
@@ -64,37 +63,144 @@ void handleClient(SOCKET clientSocket)
     );
 
 
-    if (bytesReceived > 0)
-    {
+    if (bytesReceived > 0) {
+
         buffer[bytesReceived] = '\0';
 
-        cout << "\n[WORKER " << threadId
-             << "] Request received" << endl;
 
-        cout << "-----------------" << endl;
+        cout << "\n[WORKER " << threadId
+             << "] Request received:" << endl;
+
+        cout << "----------------------------------"
+             << endl;
 
         cout << buffer << endl;
 
 
-        // ---------------------------------------------
-        // ARTIFICIAL DELAY
-        // To visibly demonstrate concurrency
-        // ---------------------------------------------
+        // ==========================================
+        // PARSE HOST HEADER
+        // ==========================================
+
+        const char* hostStart = strstr(
+            buffer,
+            "\r\nHost:"
+        );
+
+
+        // Sometimes Host can theoretically be the
+        // first header position, so also handle this.
+        if (hostStart == nullptr) {
+
+            if (strncmp(buffer, "Host:", 5) == 0) {
+                hostStart = buffer;
+            }
+        }
+
+
+        if (hostStart != nullptr) {
+
+            // Move pointer to actual host value
+            if (strncmp(hostStart, "\r\nHost:", 7) == 0) {
+
+                hostStart += 7;
+
+            } else {
+
+                hostStart += 5;
+            }
+
+
+            // Skip spaces after "Host:"
+            while (*hostStart == ' ') {
+                hostStart++;
+            }
+
+
+            // Find end of Host line
+            const char* hostEnd = strstr(
+                hostStart,
+                "\r\n"
+            );
+
+
+            if (hostEnd != nullptr) {
+
+                // Calculate host length
+                int hostLength =
+                    hostEnd - hostStart;
+
+
+                // Host buffer
+                char host[256];
+
+
+                // Safety check
+                if (hostLength >= 255) {
+                    hostLength = 255;
+                }
+
+
+                // Copy host
+                strncpy(
+                    host,
+                    hostStart,
+                    hostLength
+                );
+
+
+                // Null terminate
+                host[hostLength] = '\0';
+
+
+                cout << "\n[WORKER " << threadId
+                     << "] ================================"
+                     << endl;
+
+                cout << "[WORKER " << threadId
+                     << "] DESTINATION HOST EXTRACTED"
+                     << endl;
+
+                cout << "[WORKER " << threadId
+                     << "] Host: "
+                     << host
+                     << endl;
+
+                cout << "[WORKER " << threadId
+                     << "] ================================"
+                     << endl;
+            }
+
+        } else {
+
+            cout << "[WORKER " << threadId
+                 << "] Host header not found"
+                 << endl;
+        }
+
+
+        // ==========================================
+        // CURRENT TEMPORARY PROCESSING
+        // ==========================================
 
         cout << "[WORKER " << threadId
-             << "] STARTED processing" << endl;
+             << "] STARTED processing"
+             << endl;
+
 
         Sleep(5000);
 
+
         cout << "[WORKER " << threadId
-             << "] FINISHED processing" << endl;
+             << "] FINISHED processing"
+             << endl;
 
 
-        // ---------------------------------------------
-        // HTTP RESPONSE
-        // ---------------------------------------------
+        // ==========================================
+        // TEMPORARY RESPONSE
+        // ==========================================
 
         const char* response =
+
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: 21\r\n"
@@ -102,10 +208,6 @@ void handleClient(SOCKET clientSocket)
             "\r\n"
             "Hello from AegisProxy";
 
-
-        // ---------------------------------------------
-        // SEND RESPONSE
-        // ---------------------------------------------
 
         int bytesSent = send(
             clientSocket,
@@ -115,40 +217,36 @@ void handleClient(SOCKET clientSocket)
         );
 
 
-        if (bytesSent == SOCKET_ERROR)
-        {
+        if (bytesSent == SOCKET_ERROR) {
+
             cout << "[WORKER " << threadId
-                 << "] Send failed" << endl;
-        }
-        else
-        {
+                 << "] Send failed"
+                 << endl;
+
+        } else {
+
             cout << "[WORKER " << threadId
-                 << "] Response sent successfully" << endl;
+                 << "] Response sent"
+                 << endl;
         }
-    }
-    else if (bytesReceived == 0)
-    {
+
+    } else {
+
         cout << "[WORKER " << threadId
-             << "] Client disconnected" << endl;
-    }
-    else
-    {
-        cout << "[WORKER " << threadId
-             << "] recv() failed" << endl;
+             << "] Client disconnected or recv failed"
+             << endl;
     }
 
 
-    // ---------------------------------------------
-    // CLOSE CLIENT CONNECTION
-    // ---------------------------------------------
+    // ==========================================
+    // CLOSE CLIENT
+    // ==========================================
 
     closesocket(clientSocket);
 
-    cout << "[WORKER " << threadId
-         << "] Client connection closed" << endl;
 
     cout << "[WORKER " << threadId
-         << "] Finished task and returning to pool"
+         << "] Client closed"
          << endl;
 }
 
