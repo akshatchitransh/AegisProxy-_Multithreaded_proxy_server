@@ -1,5 +1,6 @@
 #include <iostream>
 #include <winsock2.h>
+#include <windows.h>
 #include <cstring>
 
 using namespace std;
@@ -30,6 +31,7 @@ int main() {
     );
 
     if (serverSocket == INVALID_SOCKET) {
+
         cout << "Socket creation failed" << endl;
 
         WSACleanup();
@@ -55,6 +57,7 @@ int main() {
     );
 
     if (result == SOCKET_ERROR) {
+
         cout << "Bind failed" << endl;
 
         closesocket(serverSocket);
@@ -73,6 +76,7 @@ int main() {
     );
 
     if (result == SOCKET_ERROR) {
+
         cout << "Listen failed" << endl;
 
         closesocket(serverSocket);
@@ -84,7 +88,7 @@ int main() {
     cout << "Server is listening on port 8080" << endl;
 
 
-    // Step 6+: Keep accepting clients forever
+    // Step 6: Keep accepting clients forever
     while (true) {
 
         cout << endl;
@@ -99,6 +103,7 @@ int main() {
         );
 
         if (clientSocket == INVALID_SOCKET) {
+
             cout << "Accept failed" << endl;
 
             continue;
@@ -107,7 +112,7 @@ int main() {
         cout << "Client connected!" << endl;
 
 
-        // Receive HTTP request
+        // Step 7: Receive HTTP request
         char buffer[4096];
 
         int bytesReceived = recv(
@@ -120,7 +125,7 @@ int main() {
 
         if (bytesReceived > 0) {
 
-            // Mark end of received data
+            // Add null terminator so we can print as text
             buffer[bytesReceived] = '\0';
 
             cout << endl;
@@ -128,17 +133,26 @@ int main() {
             cout << "-----------------" << endl;
 
             cout << buffer << endl;
+
         }
         else {
 
             cout << "No data received or client disconnected" << endl;
 
             closesocket(clientSocket);
+
             continue;
         }
 
 
-        // HTTP Response
+        // Artificial delay
+        // Sleep takes milliseconds
+        cout << "Processing request for 5 seconds..." << endl;
+
+        Sleep(10000);
+
+
+        // Step 8: Create HTTP response
         const char* response =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
@@ -148,7 +162,7 @@ int main() {
             "Hello from AegisProxy";
 
 
-        // Send response
+        // Step 9: Send HTTP response
         int bytesSent = send(
             clientSocket,
             response,
@@ -158,21 +172,24 @@ int main() {
 
 
         if (bytesSent == SOCKET_ERROR) {
+
             cout << "Send failed" << endl;
+
         }
         else {
+
             cout << "Response sent successfully!" << endl;
         }
 
 
-        // Close only this client connection
+        // Close only this client's connection
         closesocket(clientSocket);
 
         cout << "Client connection closed" << endl;
     }
 
 
-    // This code will normally never be reached
+    // Normally unreachable because while(true) runs forever
     closesocket(serverSocket);
 
     WSACleanup();
