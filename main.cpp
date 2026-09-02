@@ -2,38 +2,37 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <cstring>
+#include <queue>
 
 using namespace std;
 
 
 // =====================================================
-// This function runs in a separate Windows thread
+// SHARED RESOURCES
 // =====================================================
 
-DWORD WINAPI handleClient(LPVOID lpParam) {
+// Queue shared by main thread and worker threads
+queue<SOCKET> clientQueue;
 
-    // Convert generic pointer back to SOCKET pointer
-    SOCKET* clientSocketPtr =
-        static_cast<SOCKET*>(lpParam);
+// Mutex protects the queue
+HANDLE queueMutex;
 
-    // Copy actual socket value
-    SOCKET clientSocket =
-        *clientSocketPtr;
-
-    // Heap memory is no longer needed
-    delete clientSocketPtr;
+// Semaphore tells workers how many clients are available
+HANDLE clientAvailable;
 
 
-    // Get ID of current worker thread
+// =====================================================
+// HANDLE CLIENT
+// =====================================================
+
+void handleClient(SOCKET clientSocket) {
+
     DWORD threadId = GetCurrentThreadId();
 
-    cout << "\n=================================" << endl;
-    cout << "Client thread started" << endl;
-    cout << "Thread ID: " << threadId << endl;
-    cout << "=================================" << endl;
+    cout << "\n[WORKER " << threadId
+         << "] Handling client" << endl;
 
 
-    // Receive HTTP request
     char buffer[4096];
 
     int bytesReceived = recv(
@@ -46,29 +45,23 @@ DWORD WINAPI handleClient(LPVOID lpParam) {
 
     if (bytesReceived > 0) {
 
-        // Add null terminator
         buffer[bytesReceived] = '\0';
 
 
-        cout << "\nThread " << threadId
-             << " received request" << endl;
-
-        cout << "-----------------" << endl;
-
-        cout << buffer << endl;
+        cout << "[WORKER " << threadId
+             << "] Request received" << endl;
 
 
-        // Artificial delay to test concurrency
-        cout << "\nThread " << threadId
-             << " STARTED processing" << endl;
+        // Artificial delay so we can see concurrency
+        cout << "[WORKER " << threadId
+             << "] STARTED processing" << endl;
 
         Sleep(5000);
 
-        cout << "Thread " << threadId
-             << " FINISHED processing" << endl;
+        cout << "[WORKER " << threadId
+             << "] FINISHED processing" << endl;
 
 
-        // Create HTTP response
         const char* response =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
@@ -78,7 +71,6 @@ DWORD WINAPI handleClient(LPVOID lpParam) {
             "Hello from AegisProxy";
 
 
-        // Send response
         int bytesSent = send(
             clientSocket,
             response,
@@ -89,57 +81,204 @@ DWORD WINAPI handleClient(LPVOID lpParam) {
 
         if (bytesSent == SOCKET_ERROR) {
 
-            cout << "Thread " << threadId
-                 << " failed to send response"
-                 << endl;
+            cout << "[WORKER " << threadId
+                 << "] Send failed" << endl;
 
-        }
-        else {
+        } else {
 
-            cout << "Thread " << threadId
-                 << " sent response successfully"
-                 << endl;
+            cout << "[WORKER " << threadId
+                 << "] Response sent" << endl;
         }
 
-    }
-    else {
+    } else {
 
-        cout << "Thread " << threadId
-             << ": no data received or client disconnected"
-             << endl;
+        cout << "[WORKER " << threadId
+             << "] Client disconnected" << endl;
     }
 
 
-    // Close client connection
     closesocket(clientSocket);
 
-    cout << "Thread " << threadId
-         << " closed client connection"
+    cout << "[WORKER " << threadId
+         << "] Client closed" << endl;
+}
+
+
+// =====================================================
+// WORKER THREAD FUNCTION
+// =====================================================
+
+DWORD WINAPI workerFunction(LPVOID lpParam) {
+
+    DWORD threadId = GetCurrentThreadId();
+
+    cout << "[WORKER " << threadId
+         << "] Worker started and waiting for clients"
          << endl;
 
-    cout << "Thread " << threadId
-         << " finished"
-         << endl;
+
+    while (true) {
+
+        // -------------------------------------------------
+        // WAIT FOR WORK
+        //
+        // If semaphore count is 0:
+        //     worker sleeps efficiently
+        //
+        // When a client arrives:
+        //     main thread signals semaphore
+        // -------------------------------------------------
+
+        WaitForSingleObject(
+            clientAvailable,
+            INFINITE
+        );
 
 
-    // End worker thread
+        // -------------------------------------------------
+        // LOCK QUEUE
+        // -------------------------------------------------
+
+        WaitForSingleObject(
+            queueMutex,
+            INFINITE
+        );
+
+
+        // Take next client from queue
+        SOCKET clientSocket =
+            clientQueue.front();
+
+        clientQueue.pop();
+
+
+        // -------------------------------------------------
+        // UNLOCK QUEUE
+        // -------------------------------------------------
+
+        ReleaseMutex(
+            queueMutex
+        );
+
+
+        cout << "[WORKER " << threadId
+             << "] Took client from queue"
+             << endl;
+
+
+        // Handle client OUTSIDE mutex
+        //
+        // Very important:
+        // We don't want to lock the queue for 5 seconds.
+        handleClient(clientSocket);
+    }
+
+
     return 0;
 }
 
 
 // =====================================================
-// MAIN SERVER
+// MAIN
 // =====================================================
 
 int main() {
 
-    // Step 1: Initialize Winsock
+
+    // =================================================
+    // CREATE MUTEX
+    // =================================================
+
+    queueMutex = CreateMutex(
+        nullptr,
+        FALSE,
+        nullptr
+    );
+
+
+    if (queueMutex == nullptr) {
+
+        cout << "Failed to create queue mutex" << endl;
+
+        return 1;
+    }
+
+
+    // =================================================
+    // CREATE SEMAPHORE
+    //
+    // Initial count = 0
+    //
+    // Means:
+    // No clients are available yet
+    // =================================================
+
+    clientAvailable = CreateSemaphore(
+        nullptr,
+        0,
+        1000,
+        nullptr
+    );
+
+
+    if (clientAvailable == nullptr) {
+
+        cout << "Failed to create semaphore" << endl;
+
+        CloseHandle(queueMutex);
+
+        return 1;
+    }
+
+
+    // =================================================
+    // START WORKER THREADS
+    // =================================================
+
+    const int WORKER_COUNT = 3;
+
+
+    for (int i = 0; i < WORKER_COUNT; i++) {
+
+        HANDLE workerThread =
+            CreateThread(
+                nullptr,
+                0,
+                workerFunction,
+                nullptr,
+                0,
+                nullptr
+            );
+
+
+        if (workerThread == nullptr) {
+
+            cout << "Failed to create worker thread "
+                 << i << endl;
+
+        } else {
+
+            cout << "Created worker thread "
+                 << i + 1 << endl;
+
+
+            // We don't need the handle for now
+            CloseHandle(workerThread);
+        }
+    }
+
+
+    // =================================================
+    // INITIALIZE WINSOCK
+    // =================================================
+
     WSADATA wsaData;
 
     int result = WSAStartup(
         MAKEWORD(2, 2),
         &wsaData
     );
+
 
     if (result != 0) {
 
@@ -148,15 +287,22 @@ int main() {
         return 1;
     }
 
-    cout << "Winsock initialized successfully" << endl;
+
+    cout << "Winsock initialized successfully"
+         << endl;
 
 
-    // Step 2: Create TCP socket
-    SOCKET serverSocket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        IPPROTO_TCP
-    );
+    // =================================================
+    // CREATE SERVER SOCKET
+    // =================================================
+
+    SOCKET serverSocket =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            IPPROTO_TCP
+        );
+
 
     if (serverSocket == INVALID_SOCKET) {
 
@@ -167,13 +313,19 @@ int main() {
         return 1;
     }
 
-    cout << "Socket created successfully" << endl;
+
+    cout << "Socket created successfully"
+         << endl;
 
 
-    // Step 3: Configure server address
+    // =================================================
+    // CONFIGURE SERVER ADDRESS
+    // =================================================
+
     sockaddr_in serverAddress;
 
-    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_family =
+        AF_INET;
 
     serverAddress.sin_addr.s_addr =
         INADDR_ANY;
@@ -182,12 +334,16 @@ int main() {
         htons(8080);
 
 
-    // Step 4: Bind socket
+    // =================================================
+    // BIND
+    // =================================================
+
     result = bind(
         serverSocket,
         reinterpret_cast<sockaddr*>(&serverAddress),
         sizeof(serverAddress)
     );
+
 
     if (result == SOCKET_ERROR) {
 
@@ -200,14 +356,20 @@ int main() {
         return 1;
     }
 
-    cout << "Socket bound successfully to port 8080" << endl;
+
+    cout << "Socket bound to port 8080"
+         << endl;
 
 
-    // Step 5: Listen
+    // =================================================
+    // LISTEN
+    // =================================================
+
     result = listen(
         serverSocket,
         SOMAXCONN
     );
+
 
     if (result == SOCKET_ERROR) {
 
@@ -220,96 +382,96 @@ int main() {
         return 1;
     }
 
-    cout << "Server is listening on port 8080" << endl;
+
+    cout << "Server listening on port 8080"
+         << endl;
 
 
-    // =====================================================
-    // MAIN THREAD: ONLY ACCEPTS CLIENTS
-    // =====================================================
+    // =================================================
+    // MAIN THREAD = PRODUCER
+    // =================================================
 
     while (true) {
 
-        cout << "\n[MAIN THREAD] Waiting for a client..."
+        cout << "\n[MAIN] Waiting for client..."
              << endl;
 
 
-        // Create separate memory for every client's socket
-        SOCKET* clientSocketPtr =
-            new SOCKET;
+        SOCKET clientSocket =
+            accept(
+                serverSocket,
+                nullptr,
+                nullptr
+            );
 
 
-        // Accept client
-        *clientSocketPtr = accept(
-            serverSocket,
-            nullptr,
+        if (clientSocket == INVALID_SOCKET) {
+
+            cout << "[MAIN] Accept failed"
+                 << endl;
+
+            continue;
+        }
+
+
+        cout << "[MAIN] Client accepted"
+             << endl;
+
+
+        // ---------------------------------------------
+        // LOCK QUEUE
+        // ---------------------------------------------
+
+        WaitForSingleObject(
+            queueMutex,
+            INFINITE
+        );
+
+
+        // Add client socket to shared queue
+        clientQueue.push(
+            clientSocket
+        );
+
+
+        cout << "[MAIN] Client added to queue"
+             << endl;
+
+
+        // ---------------------------------------------
+        // UNLOCK QUEUE
+        // ---------------------------------------------
+
+        ReleaseMutex(
+            queueMutex
+        );
+
+
+        // ---------------------------------------------
+        // SIGNAL ONE WORKER
+        // ---------------------------------------------
+
+        ReleaseSemaphore(
+            clientAvailable,
+            1,
             nullptr
         );
 
 
-        if (*clientSocketPtr == INVALID_SOCKET) {
-
-            cout << "[MAIN THREAD] Accept failed"
-                 << endl;
-
-            delete clientSocketPtr;
-
-            continue;
-        }
-
-
-        cout << "[MAIN THREAD] Client accepted"
+        cout << "[MAIN] Worker notified"
              << endl;
-
-
-        // Create a separate Windows OS thread
-        HANDLE clientThread = CreateThread(
-
-            nullptr,          // Default security attributes
-
-            0,                // Default stack size
-
-            handleClient,     // Function executed by new thread
-
-            clientSocketPtr,  // Argument passed to thread
-
-            0,                // Start immediately
-
-            nullptr           // We don't need thread ID here
-        );
-
-
-        if (clientThread == nullptr) {
-
-            cout << "[MAIN THREAD] Thread creation failed"
-                 << endl;
-
-            closesocket(*clientSocketPtr);
-
-            delete clientSocketPtr;
-
-            continue;
-        }
-
-
-        cout << "[MAIN THREAD] Worker thread created"
-             << endl;
-
-
-        // We don't want main thread to wait for worker thread.
-        //
-        // CloseHandle DOES NOT stop the thread.
-        // It only releases the main thread's HANDLE reference.
-        CloseHandle(clientThread);
-
-
-        // Immediately loop back to accept another client
     }
 
 
     // Normally unreachable
+
     closesocket(serverSocket);
 
     WSACleanup();
+
+    CloseHandle(queueMutex);
+
+    CloseHandle(clientAvailable);
 
     return 0;
 }
