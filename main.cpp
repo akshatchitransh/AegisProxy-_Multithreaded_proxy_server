@@ -459,6 +459,58 @@ void handleClient(SOCKET clientSocket)
          << "] Successfully connected to destination!"
          << endl;
 
+         // =================================================
+// FORWARD ORIGINAL REQUEST TO DESTINATION SERVER
+// =================================================
+
+cout << "\n[WORKER " << threadId
+     << "] Forwarding request to destination..."
+     << endl;
+
+
+// buffer contains the original request received from client
+// bytesReceived tells us how many bytes were actually received
+
+int totalSent = 0;
+
+
+while (totalSent < bytesReceived)
+{
+    int bytesSentToServer = send(
+
+        destinationSocket,
+
+        buffer + totalSent,
+
+        bytesReceived - totalSent,
+
+        0
+
+    );
+
+
+    if (bytesSentToServer == SOCKET_ERROR)
+    {
+        cout << "[WORKER " << threadId
+             << "] Failed to forward request to destination"
+             << endl;
+
+
+        closesocket(destinationSocket);
+        closesocket(clientSocket);
+
+        return;
+    }
+
+
+    totalSent += bytesSentToServer;
+}
+
+
+cout << "[WORKER " << threadId
+     << "] Request successfully forwarded!"
+     << endl;
+
 
     // =================================================
     // CURRENT TEMPORARY RESPONSE
