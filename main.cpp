@@ -8,30 +8,51 @@ using namespace std;
 
 
 // =====================================================
+// CONFIGURATION
+// =====================================================
+
+const int WORKER_COUNT = 3;
+const int MAX_QUEUE_SIZE = 5;
+
+
+// =====================================================
 // SHARED RESOURCES
 // =====================================================
 
-// Queue shared by main thread and worker threads
+// Shared queue containing accepted client sockets
 queue<SOCKET> clientQueue;
+
 
 // Mutex protects the queue
 HANDLE queueMutex;
 
-// Semaphore tells workers how many clients are available
+
+// Semaphore:
+// Number of clients currently available in queue
 HANDLE clientAvailable;
+
+
+// Semaphore:
+// Number of empty slots available in queue
+HANDLE emptySlots;
 
 
 // =====================================================
 // HANDLE CLIENT
 // =====================================================
 
-void handleClient(SOCKET clientSocket) {
-
+void handleClient(SOCKET clientSocket)
+{
     DWORD threadId = GetCurrentThreadId();
 
-    cout << "\n[WORKER " << threadId
-         << "] Handling client" << endl;
+    cout << "\n=================================" << endl;
+    cout << "[WORKER " << threadId << "] Handling client" << endl;
+    cout << "=================================" << endl;
 
+
+    // ---------------------------------------------
+    // RECEIVE REQUEST
+    // ---------------------------------------------
 
     char buffer[4096];
 
@@ -43,16 +64,23 @@ void handleClient(SOCKET clientSocket) {
     );
 
 
-    if (bytesReceived > 0) {
-
+    if (bytesReceived > 0)
+    {
         buffer[bytesReceived] = '\0';
 
-
-        cout << "[WORKER " << threadId
+        cout << "\n[WORKER " << threadId
              << "] Request received" << endl;
 
+        cout << "-----------------" << endl;
 
-        // Artificial delay so we can see concurrency
+        cout << buffer << endl;
+
+
+        // ---------------------------------------------
+        // ARTIFICIAL DELAY
+        // To visibly demonstrate concurrency
+        // ---------------------------------------------
+
         cout << "[WORKER " << threadId
              << "] STARTED processing" << endl;
 
@@ -61,6 +89,10 @@ void handleClient(SOCKET clientSocket) {
         cout << "[WORKER " << threadId
              << "] FINISHED processing" << endl;
 
+
+        // ---------------------------------------------
+        // HTTP RESPONSE
+        // ---------------------------------------------
 
         const char* response =
             "HTTP/1.1 200 OK\r\n"
@@ -71,6 +103,10 @@ void handleClient(SOCKET clientSocket) {
             "Hello from AegisProxy";
 
 
+        // ---------------------------------------------
+        // SEND RESPONSE
+        // ---------------------------------------------
+
         int bytesSent = send(
             clientSocket,
             response,
@@ -79,28 +115,41 @@ void handleClient(SOCKET clientSocket) {
         );
 
 
-        if (bytesSent == SOCKET_ERROR) {
-
+        if (bytesSent == SOCKET_ERROR)
+        {
             cout << "[WORKER " << threadId
                  << "] Send failed" << endl;
-
-        } else {
-
-            cout << "[WORKER " << threadId
-                 << "] Response sent" << endl;
         }
-
-    } else {
-
+        else
+        {
+            cout << "[WORKER " << threadId
+                 << "] Response sent successfully" << endl;
+        }
+    }
+    else if (bytesReceived == 0)
+    {
         cout << "[WORKER " << threadId
              << "] Client disconnected" << endl;
     }
+    else
+    {
+        cout << "[WORKER " << threadId
+             << "] recv() failed" << endl;
+    }
 
+
+    // ---------------------------------------------
+    // CLOSE CLIENT CONNECTION
+    // ---------------------------------------------
 
     closesocket(clientSocket);
 
     cout << "[WORKER " << threadId
-         << "] Client closed" << endl;
+         << "] Client connection closed" << endl;
+
+    cout << "[WORKER " << threadId
+         << "] Finished task and returning to pool"
+         << endl;
 }
 
 
@@ -108,26 +157,25 @@ void handleClient(SOCKET clientSocket) {
 // WORKER THREAD FUNCTION
 // =====================================================
 
-DWORD WINAPI workerFunction(LPVOID lpParam) {
-
+DWORD WINAPI workerFunction(LPVOID lpParam)
+{
     DWORD threadId = GetCurrentThreadId();
 
     cout << "[WORKER " << threadId
-         << "] Worker started and waiting for clients"
+         << "] Started and waiting for tasks"
          << endl;
 
 
-    while (true) {
-
-        // -------------------------------------------------
-        // WAIT FOR WORK
+    // Worker lives forever
+    while (true)
+    {
+        // =============================================
+        // STEP 1:
+        // WAIT FOR A CLIENT TO BECOME AVAILABLE
         //
-        // If semaphore count is 0:
-        //     worker sleeps efficiently
-        //
-        // When a client arrives:
-        //     main thread signals semaphore
-        // -------------------------------------------------
+        // If queue has 0 clients:
+        // Worker sleeps efficiently here
+        // =============================================
 
         WaitForSingleObject(
             clientAvailable,
@@ -135,9 +183,10 @@ DWORD WINAPI workerFunction(LPVOID lpParam) {
         );
 
 
-        // -------------------------------------------------
+        // =============================================
+        // STEP 2:
         // LOCK QUEUE
-        // -------------------------------------------------
+        // =============================================
 
         WaitForSingleObject(
             queueMutex,
@@ -145,32 +194,63 @@ DWORD WINAPI workerFunction(LPVOID lpParam) {
         );
 
 
-        // Take next client from queue
-        SOCKET clientSocket =
-            clientQueue.front();
+        // =============================================
+        // STEP 3:
+        // TAKE CLIENT FROM QUEUE
+        // =============================================
+
+        SOCKET clientSocket = clientQueue.front();
 
         clientQueue.pop();
-
-
-        // -------------------------------------------------
-        // UNLOCK QUEUE
-        // -------------------------------------------------
-
-        ReleaseMutex(
-            queueMutex
-        );
-
 
         cout << "[WORKER " << threadId
              << "] Took client from queue"
              << endl;
 
+        cout << "[WORKER " << threadId
+             << "] Queue size after pop: "
+             << clientQueue.size()
+             << endl;
 
-        // Handle client OUTSIDE mutex
+
+        // =============================================
+        // STEP 4:
+        // UNLOCK QUEUE
+        // =============================================
+
+        ReleaseMutex(queueMutex);
+
+
+        // =============================================
+        // STEP 5:
+        // INFORM PRODUCER THAT ONE SLOT IS NOW EMPTY
+        // =============================================
+
+        ReleaseSemaphore(
+            emptySlots,
+            1,
+            nullptr
+        );
+
+
+        // =============================================
+        // STEP 6:
+        // HANDLE CLIENT
         //
-        // Very important:
-        // We don't want to lock the queue for 5 seconds.
+        // IMPORTANT:
+        // This happens OUTSIDE THE MUTEX
+        //
+        // Other workers can access queue meanwhile
+        // =============================================
+
         handleClient(clientSocket);
+
+
+        // After handling:
+        //
+        // Worker DOES NOT DIE.
+        //
+        // It loops back and waits for another task.
     }
 
 
@@ -182,11 +262,10 @@ DWORD WINAPI workerFunction(LPVOID lpParam) {
 // MAIN
 // =====================================================
 
-int main() {
-
-
+int main()
+{
     // =================================================
-    // CREATE MUTEX
+    // CREATE QUEUE MUTEX
     // =================================================
 
     queueMutex = CreateMutex(
@@ -196,34 +275,33 @@ int main() {
     );
 
 
-    if (queueMutex == nullptr) {
-
+    if (queueMutex == nullptr)
+    {
         cout << "Failed to create queue mutex" << endl;
-
         return 1;
     }
 
 
     // =================================================
-    // CREATE SEMAPHORE
+    // CREATE CLIENT AVAILABLE SEMAPHORE
     //
-    // Initial count = 0
+    // Initial value = 0
     //
-    // Means:
-    // No clients are available yet
+    // Initially queue is empty.
     // =================================================
 
     clientAvailable = CreateSemaphore(
         nullptr,
         0,
-        1000,
+        MAX_QUEUE_SIZE,
         nullptr
     );
 
 
-    if (clientAvailable == nullptr) {
-
-        cout << "Failed to create semaphore" << endl;
+    if (clientAvailable == nullptr)
+    {
+        cout << "Failed to create clientAvailable semaphore"
+             << endl;
 
         CloseHandle(queueMutex);
 
@@ -232,37 +310,79 @@ int main() {
 
 
     // =================================================
-    // START WORKER THREADS
+    // CREATE EMPTY SLOTS SEMAPHORE
+    //
+    // Initially:
+    //
+    // Queue is completely empty
+    //
+    // Therefore:
+    //
+    // Empty slots = MAX_QUEUE_SIZE
     // =================================================
 
-    const int WORKER_COUNT = 3;
+    emptySlots = CreateSemaphore(
+        nullptr,
+        MAX_QUEUE_SIZE,
+        MAX_QUEUE_SIZE,
+        nullptr
+    );
 
 
-    for (int i = 0; i < WORKER_COUNT; i++) {
+    if (emptySlots == nullptr)
+    {
+        cout << "Failed to create emptySlots semaphore"
+             << endl;
 
-        HANDLE workerThread =
-            CreateThread(
-                nullptr,
-                0,
-                workerFunction,
-                nullptr,
-                0,
-                nullptr
-            );
+        CloseHandle(queueMutex);
+        CloseHandle(clientAvailable);
 
-
-        if (workerThread == nullptr) {
-
-            cout << "Failed to create worker thread "
-                 << i << endl;
-
-        } else {
-
-            cout << "Created worker thread "
-                 << i + 1 << endl;
+        return 1;
+    }
 
 
-            // We don't need the handle for now
+    // =================================================
+    // CREATE WORKER THREADS
+    //
+    // THESE ARE CREATED BEFORE ANY CLIENT ARRIVES
+    //
+    // This is the Thread Pool
+    // =================================================
+
+    cout << "\nCreating Thread Pool..." << endl;
+
+
+    for (int i = 0; i < WORKER_COUNT; i++)
+    {
+        HANDLE workerThread = CreateThread(
+            nullptr,
+            0,
+            workerFunction,
+            nullptr,
+            0,
+            nullptr
+        );
+
+
+        if (workerThread == nullptr)
+        {
+            cout << "Failed to create worker "
+                 << i + 1
+                 << endl;
+        }
+        else
+        {
+            cout << "Worker "
+                 << i + 1
+                 << " created successfully"
+                 << endl;
+
+
+            // We don't need to join these threads.
+            //
+            // Closing the HANDLE does NOT kill thread.
+            //
+            // Thread continues running.
             CloseHandle(workerThread);
         }
     }
@@ -274,21 +394,21 @@ int main() {
 
     WSADATA wsaData;
 
+
     int result = WSAStartup(
         MAKEWORD(2, 2),
         &wsaData
     );
 
 
-    if (result != 0) {
-
+    if (result != 0)
+    {
         cout << "WSAStartup failed" << endl;
-
         return 1;
     }
 
 
-    cout << "Winsock initialized successfully"
+    cout << "\nWinsock initialized successfully"
          << endl;
 
 
@@ -296,16 +416,15 @@ int main() {
     // CREATE SERVER SOCKET
     // =================================================
 
-    SOCKET serverSocket =
-        socket(
-            AF_INET,
-            SOCK_STREAM,
-            IPPROTO_TCP
-        );
+    SOCKET serverSocket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        IPPROTO_TCP
+    );
 
 
-    if (serverSocket == INVALID_SOCKET) {
-
+    if (serverSocket == INVALID_SOCKET)
+    {
         cout << "Socket creation failed" << endl;
 
         WSACleanup();
@@ -314,7 +433,7 @@ int main() {
     }
 
 
-    cout << "Socket created successfully"
+    cout << "Server socket created successfully"
          << endl;
 
 
@@ -324,14 +443,11 @@ int main() {
 
     sockaddr_in serverAddress;
 
-    serverAddress.sin_family =
-        AF_INET;
+    serverAddress.sin_family = AF_INET;
 
-    serverAddress.sin_addr.s_addr =
-        INADDR_ANY;
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
 
-    serverAddress.sin_port =
-        htons(8080);
+    serverAddress.sin_port = htons(8080);
 
 
     // =================================================
@@ -345,8 +461,8 @@ int main() {
     );
 
 
-    if (result == SOCKET_ERROR) {
-
+    if (result == SOCKET_ERROR)
+    {
         cout << "Bind failed" << endl;
 
         closesocket(serverSocket);
@@ -371,8 +487,8 @@ int main() {
     );
 
 
-    if (result == SOCKET_ERROR) {
-
+    if (result == SOCKET_ERROR)
+    {
         cout << "Listen failed" << endl;
 
         closesocket(serverSocket);
@@ -389,24 +505,29 @@ int main() {
 
     // =================================================
     // MAIN THREAD = PRODUCER
+    //
+    // Workers = CONSUMERS
     // =================================================
 
-    while (true) {
-
+    while (true)
+    {
         cout << "\n[MAIN] Waiting for client..."
              << endl;
 
 
-        SOCKET clientSocket =
-            accept(
-                serverSocket,
-                nullptr,
-                nullptr
-            );
+        // ---------------------------------------------
+        // ACCEPT CLIENT
+        // ---------------------------------------------
+
+        SOCKET clientSocket = accept(
+            serverSocket,
+            nullptr,
+            nullptr
+        );
 
 
-        if (clientSocket == INVALID_SOCKET) {
-
+        if (clientSocket == INVALID_SOCKET)
+        {
             cout << "[MAIN] Accept failed"
                  << endl;
 
@@ -418,9 +539,23 @@ int main() {
              << endl;
 
 
-        // ---------------------------------------------
+        // =============================================
+        // WAIT FOR EMPTY SLOT
+        //
+        // If queue is full:
+        //
+        // Main thread blocks efficiently here.
+        // =============================================
+
+        WaitForSingleObject(
+            emptySlots,
+            INFINITE
+        );
+
+
+        // =============================================
         // LOCK QUEUE
-        // ---------------------------------------------
+        // =============================================
 
         WaitForSingleObject(
             queueMutex,
@@ -428,28 +563,35 @@ int main() {
         );
 
 
-        // Add client socket to shared queue
-        clientQueue.push(
-            clientSocket
-        );
+        // =============================================
+        // ADD CLIENT TO QUEUE
+        // =============================================
+
+        clientQueue.push(clientSocket);
 
 
         cout << "[MAIN] Client added to queue"
              << endl;
 
+        cout << "[MAIN] Queue size: "
+             << clientQueue.size()
+             << endl;
 
-        // ---------------------------------------------
+
+        // =============================================
         // UNLOCK QUEUE
-        // ---------------------------------------------
+        // =============================================
 
         ReleaseMutex(
             queueMutex
         );
 
 
-        // ---------------------------------------------
-        // SIGNAL ONE WORKER
-        // ---------------------------------------------
+        // =============================================
+        // INFORM WORKER:
+        //
+        // One client is available.
+        // =============================================
 
         ReleaseSemaphore(
             clientAvailable,
@@ -458,12 +600,16 @@ int main() {
         );
 
 
-        cout << "[MAIN] Worker notified"
+        cout << "[MAIN] One worker notified"
              << endl;
     }
 
 
-    // Normally unreachable
+    // =================================================
+    // CLEANUP
+    //
+    // Currently unreachable because of while(true)
+    // =================================================
 
     closesocket(serverSocket);
 
@@ -472,6 +618,9 @@ int main() {
     CloseHandle(queueMutex);
 
     CloseHandle(clientAvailable);
+
+    CloseHandle(emptySlots);
+
 
     return 0;
 }
