@@ -5,6 +5,132 @@
 
 using namespace std;
 
+
+// =====================================================
+// This function runs in a separate Windows thread
+// =====================================================
+
+DWORD WINAPI handleClient(LPVOID lpParam) {
+
+    // Convert generic pointer back to SOCKET pointer
+    SOCKET* clientSocketPtr =
+        static_cast<SOCKET*>(lpParam);
+
+    // Copy actual socket value
+    SOCKET clientSocket =
+        *clientSocketPtr;
+
+    // Heap memory is no longer needed
+    delete clientSocketPtr;
+
+
+    // Get ID of current worker thread
+    DWORD threadId = GetCurrentThreadId();
+
+    cout << "\n=================================" << endl;
+    cout << "Client thread started" << endl;
+    cout << "Thread ID: " << threadId << endl;
+    cout << "=================================" << endl;
+
+
+    // Receive HTTP request
+    char buffer[4096];
+
+    int bytesReceived = recv(
+        clientSocket,
+        buffer,
+        sizeof(buffer) - 1,
+        0
+    );
+
+
+    if (bytesReceived > 0) {
+
+        // Add null terminator
+        buffer[bytesReceived] = '\0';
+
+
+        cout << "\nThread " << threadId
+             << " received request" << endl;
+
+        cout << "-----------------" << endl;
+
+        cout << buffer << endl;
+
+
+        // Artificial delay to test concurrency
+        cout << "\nThread " << threadId
+             << " STARTED processing" << endl;
+
+        Sleep(5000);
+
+        cout << "Thread " << threadId
+             << " FINISHED processing" << endl;
+
+
+        // Create HTTP response
+        const char* response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 21\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Hello from AegisProxy";
+
+
+        // Send response
+        int bytesSent = send(
+            clientSocket,
+            response,
+            strlen(response),
+            0
+        );
+
+
+        if (bytesSent == SOCKET_ERROR) {
+
+            cout << "Thread " << threadId
+                 << " failed to send response"
+                 << endl;
+
+        }
+        else {
+
+            cout << "Thread " << threadId
+                 << " sent response successfully"
+                 << endl;
+        }
+
+    }
+    else {
+
+        cout << "Thread " << threadId
+             << ": no data received or client disconnected"
+             << endl;
+    }
+
+
+    // Close client connection
+    closesocket(clientSocket);
+
+    cout << "Thread " << threadId
+         << " closed client connection"
+         << endl;
+
+    cout << "Thread " << threadId
+         << " finished"
+         << endl;
+
+
+    // End worker thread
+    return 0;
+}
+
+
+// =====================================================
+// MAIN SERVER
+// =====================================================
+
 int main() {
 
     // Step 1: Initialize Winsock
@@ -16,14 +142,16 @@ int main() {
     );
 
     if (result != 0) {
+
         cout << "WSAStartup failed" << endl;
+
         return 1;
     }
 
     cout << "Winsock initialized successfully" << endl;
 
 
-    // Step 2: Create TCP server socket
+    // Step 2: Create TCP socket
     SOCKET serverSocket = socket(
         AF_INET,
         SOCK_STREAM,
@@ -35,6 +163,7 @@ int main() {
         cout << "Socket creation failed" << endl;
 
         WSACleanup();
+
         return 1;
     }
 
@@ -45,11 +174,15 @@ int main() {
     sockaddr_in serverAddress;
 
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
-    serverAddress.sin_port = htons(8080);
+
+    serverAddress.sin_addr.s_addr =
+        INADDR_ANY;
+
+    serverAddress.sin_port =
+        htons(8080);
 
 
-    // Step 4: Bind socket to port 8080
+    // Step 4: Bind socket
     result = bind(
         serverSocket,
         reinterpret_cast<sockaddr*>(&serverAddress),
@@ -61,6 +194,7 @@ int main() {
         cout << "Bind failed" << endl;
 
         closesocket(serverSocket);
+
         WSACleanup();
 
         return 1;
@@ -69,7 +203,7 @@ int main() {
     cout << "Socket bound successfully to port 8080" << endl;
 
 
-    // Step 5: Listen for incoming connections
+    // Step 5: Listen
     result = listen(
         serverSocket,
         SOMAXCONN
@@ -80,6 +214,7 @@ int main() {
         cout << "Listen failed" << endl;
 
         closesocket(serverSocket);
+
         WSACleanup();
 
         return 1;
@@ -88,108 +223,90 @@ int main() {
     cout << "Server is listening on port 8080" << endl;
 
 
-    // Step 6: Keep accepting clients forever
+    // =====================================================
+    // MAIN THREAD: ONLY ACCEPTS CLIENTS
+    // =====================================================
+
     while (true) {
 
-        cout << endl;
-        cout << "Waiting for a client..." << endl;
+        cout << "\n[MAIN THREAD] Waiting for a client..."
+             << endl;
 
 
-        // Accept a new client
-        SOCKET clientSocket = accept(
+        // Create separate memory for every client's socket
+        SOCKET* clientSocketPtr =
+            new SOCKET;
+
+
+        // Accept client
+        *clientSocketPtr = accept(
             serverSocket,
             nullptr,
             nullptr
         );
 
-        if (clientSocket == INVALID_SOCKET) {
 
-            cout << "Accept failed" << endl;
+        if (*clientSocketPtr == INVALID_SOCKET) {
 
-            continue;
-        }
+            cout << "[MAIN THREAD] Accept failed"
+                 << endl;
 
-        cout << "Client connected!" << endl;
-
-
-        // Step 7: Receive HTTP request
-        char buffer[4096];
-
-        int bytesReceived = recv(
-            clientSocket,
-            buffer,
-            sizeof(buffer) - 1,
-            0
-        );
-
-
-        if (bytesReceived > 0) {
-
-            // Add null terminator so we can print as text
-            buffer[bytesReceived] = '\0';
-
-            cout << endl;
-            cout << "Request received:" << endl;
-            cout << "-----------------" << endl;
-
-            cout << buffer << endl;
-
-        }
-        else {
-
-            cout << "No data received or client disconnected" << endl;
-
-            closesocket(clientSocket);
+            delete clientSocketPtr;
 
             continue;
         }
 
 
-        // Artificial delay
-        // Sleep takes milliseconds
-        cout << "Processing request for 5 seconds..." << endl;
-
-        Sleep(10000);
+        cout << "[MAIN THREAD] Client accepted"
+             << endl;
 
 
-        // Step 8: Create HTTP response
-        const char* response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 21\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Hello from AegisProxy";
+        // Create a separate Windows OS thread
+        HANDLE clientThread = CreateThread(
 
+            nullptr,          // Default security attributes
 
-        // Step 9: Send HTTP response
-        int bytesSent = send(
-            clientSocket,
-            response,
-            strlen(response),
-            0
+            0,                // Default stack size
+
+            handleClient,     // Function executed by new thread
+
+            clientSocketPtr,  // Argument passed to thread
+
+            0,                // Start immediately
+
+            nullptr           // We don't need thread ID here
         );
 
 
-        if (bytesSent == SOCKET_ERROR) {
+        if (clientThread == nullptr) {
 
-            cout << "Send failed" << endl;
+            cout << "[MAIN THREAD] Thread creation failed"
+                 << endl;
 
+            closesocket(*clientSocketPtr);
+
+            delete clientSocketPtr;
+
+            continue;
         }
-        else {
-
-            cout << "Response sent successfully!" << endl;
-        }
 
 
-        // Close only this client's connection
-        closesocket(clientSocket);
+        cout << "[MAIN THREAD] Worker thread created"
+             << endl;
 
-        cout << "Client connection closed" << endl;
+
+        // We don't want main thread to wait for worker thread.
+        //
+        // CloseHandle DOES NOT stop the thread.
+        // It only releases the main thread's HANDLE reference.
+        CloseHandle(clientThread);
+
+
+        // Immediately loop back to accept another client
     }
 
 
-    // Normally unreachable because while(true) runs forever
+    // Normally unreachable
     closesocket(serverSocket);
 
     WSACleanup();
