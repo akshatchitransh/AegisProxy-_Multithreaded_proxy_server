@@ -165,6 +165,72 @@ void handleClient(SOCKET clientSocket) {
                      << host
                      << endl;
 
+                     // ==========================================
+// PARSE HOSTNAME AND PORT
+// ==========================================
+
+char hostname[256];
+int port = 80;   // Default HTTP port
+
+// Look for ':' inside the Host value
+char* colon = strchr(host, ':');
+
+if (colon != nullptr) {
+
+    // Separate hostname and port
+
+    int hostnameLength = colon - host;
+
+    if (hostnameLength >= 255) {
+        hostnameLength = 255;
+    }
+
+    // Copy hostname part
+    strncpy(
+        hostname,
+        host,
+        hostnameLength
+    );
+
+    hostname[hostnameLength] = '\0';
+
+
+    // Convert port string to integer
+    port = atoi(colon + 1);
+
+} else {
+
+    // No port specified
+    // Entire Host value is hostname
+
+    strncpy(
+        hostname,
+        host,
+        sizeof(hostname) - 1
+    );
+
+    hostname[sizeof(hostname) - 1] = '\0';
+}
+
+
+// ==========================================
+// PRINT PARSED DESTINATION
+// ==========================================
+
+cout << "\n[WORKER " << threadId
+     << "] DESTINATION PARSED"
+     << endl;
+
+cout << "[WORKER " << threadId
+     << "] Hostname: "
+     << hostname
+     << endl;
+
+cout << "[WORKER " << threadId
+     << "] Port: "
+     << port
+     << endl;
+
                 cout << "[WORKER " << threadId
                      << "] ================================"
                      << endl;
