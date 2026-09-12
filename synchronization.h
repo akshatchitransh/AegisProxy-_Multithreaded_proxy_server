@@ -4,8 +4,8 @@
 #include <windows.h>
 #include <queue>
 
-const int WORKER_COUNT = 3;
-const int MAX_QUEUE_SIZE = 5;
+const int WORKER_COUNT =  50;
+const int MAX_QUEUE_SIZE = 100;
 
 extern std::queue<SOCKET> clientQueue;
 

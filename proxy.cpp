@@ -3,520 +3,208 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-
+#include "cache.h"
 #include <iostream>
 #include <cstring>
-#include <cstdlib>
 #include <string>
-
-#include "proxy.h"
-#include "cache.h"
-
+#include <sstream>
 using namespace std;
 
 
 // =====================================================
-// LRU RESPONSE CACHE
+// GLOBAL CACHE
 // =====================================================
 
-// Maximum 5 responses
 LRUCache responseCache(5);
 
 
 // =====================================================
-// HANDLE CLIENT
+// SEND ALL DATA
 // =====================================================
 
-void handleClient(SOCKET clientSocket)
+bool sendAll(
+    SOCKET socket,
+    const char* data,
+    int length
+)
 {
-    DWORD threadId = GetCurrentThreadId();
+    int totalSent = 0;
 
-    cout << "\n=====================================" << endl;
-    cout << "[WORKER " << threadId << "] Handling client" << endl;
-    cout << "=====================================" << endl;
+    while (totalSent < length)
+    {
+        int bytesSent = send(
+            socket,
+            data + totalSent,
+            length - totalSent,
+            0
+        );
+
+        if (bytesSent == SOCKET_ERROR)
+        {
+            return false;
+        }
+
+        totalSent += bytesSent;
+    }
+
+    return true;
+}
 
 
-    // =================================================
-    // RECEIVE HTTP REQUEST FROM CLIENT
-    // =================================================
+// =====================================================
+// RECEIVE HTTP HEADERS
+// =====================================================
 
+bool receiveHttpRequest(
+    SOCKET clientSocket,
+    string& request
+)
+{
     char buffer[4096];
 
-    int bytesReceived = recv(
-        clientSocket,
-        buffer,
-        sizeof(buffer) - 1,
-        0
-    );
+    request.clear();
 
-
-    if (bytesReceived == 0)
+    while (request.find("\r\n\r\n") == string::npos)
     {
-        cout << "[WORKER " << threadId
-             << "] Client disconnected"
-             << endl;
+        int bytesReceived = recv(
+            clientSocket,
+            buffer,
+            sizeof(buffer),
+            0
+        );
 
-        closesocket(clientSocket);
-        return;
-    }
-
-
-    if (bytesReceived == SOCKET_ERROR)
-    {
-        cout << "[WORKER " << threadId
-             << "] recv() failed"
-             << endl;
-
-        closesocket(clientSocket);
-        return;
-    }
-
-
-    // Null terminator only for parsing/printing
-    buffer[bytesReceived] = '\0';
-
-
-    cout << "\n[WORKER " << threadId
-         << "] REQUEST RECEIVED"
-         << endl;
-
-    cout << "-------------------------------------" << endl;
-    cout << buffer << endl;
-    cout << "-------------------------------------" << endl;
-
-
-    // =================================================
-    // CHECK HTTP METHOD AND EXTRACT REQUEST TARGET
-    // =================================================
-
-    string request(
-        buffer,
-        bytesReceived
-    );
-
-    bool isGetRequest = false;
-
-    string requestTarget;
-
-
-    // Find first line
-    size_t firstLineEnd = request.find(
-        "\r\n"
-    );
-
-
-    if (firstLineEnd != string::npos)
-    {
-        string requestLine =
-            request.substr(
-                0,
-                firstLineEnd
-            );
-
-        // Find first space
-        size_t firstSpace =
-            requestLine.find(' ');
-
-        // Find second space
-        size_t secondSpace =
-            requestLine.find(
-                ' ',
-                firstSpace + 1
-            );
-
-
-        if (
-            firstSpace != string::npos &&
-            secondSpace != string::npos
-        )
+        if (bytesReceived <= 0)
         {
-            string method =
-                requestLine.substr(
-                    0,
-                    firstSpace
-                );
+            return false;
+        }
 
-            requestTarget =
-                requestLine.substr(
-                    firstSpace + 1,
-                    secondSpace - firstSpace - 1
-                );
+        request.append(
+            buffer,
+            bytesReceived
+        );
 
-
-            if (method == "GET")
-            {
-                isGetRequest = true;
-            }
+        // Safety limit
+        if (request.size() > 65536)
+        {
+            return false;
         }
     }
 
-
-    // =================================================
-    // EXTRACT HOST HEADER
-    // =================================================
-
-    const char* hostStart = strstr(
-        buffer,
-        "\r\nHost:"
-    );
+    return true;
+}
 
 
-    // In case Host happens to be at the start
-    if (hostStart == nullptr)
+// =====================================================
+// EXTRACT HOST
+// =====================================================
+
+bool extractHost(
+    const string& request,
+    string& host
+)
+{
+    size_t position =
+        request.find("\r\nHost:");
+
+    if (position == string::npos)
     {
-        if (strncmp(buffer, "Host:", 5) == 0)
-        {
-            hostStart = buffer;
-        }
+        position =
+            request.find("Host:");
     }
 
-
-    if (hostStart == nullptr)
+    if (position == string::npos)
     {
-        cout << "[WORKER " << threadId
-             << "] Host header not found"
-             << endl;
-
-        closesocket(clientSocket);
-        return;
+        return false;
     }
 
+    position =
+        request.find(':', position);
 
-    // Move pointer after "Host:"
-    if (strncmp(hostStart, "\r\nHost:", 7) == 0)
+    if (position == string::npos)
     {
-        hostStart += 7;
-    }
-    else
-    {
-        hostStart += 5;
+        return false;
     }
 
+    position++;
 
     // Skip spaces
-    while (*hostStart == ' ')
-    {
-        hostStart++;
-    }
-
-
-    // Find end of Host header
-    const char* hostEnd = strstr(
-        hostStart,
-        "\r\n"
-    );
-
-
-    if (hostEnd == nullptr)
-    {
-        cout << "[WORKER " << threadId
-             << "] Invalid Host header"
-             << endl;
-
-        closesocket(clientSocket);
-        return;
-    }
-
-
-    // =================================================
-    // COPY HOST VALUE
-    // =================================================
-
-    int hostLength =
-        static_cast<int>(
-            hostEnd - hostStart
-        );
-
-
-    char host[256];
-
-
-    if (
-        hostLength >=
-        static_cast<int>(sizeof(host))
+    while (
+        position < request.size() &&
+        request[position] == ' '
     )
     {
-        cout << "[WORKER " << threadId
-             << "] Host header too large"
-             << endl;
-
-        closesocket(clientSocket);
-        return;
+        position++;
     }
 
+    size_t end =
+        request.find("\r\n", position);
 
-    strncpy(
-        host,
-        hostStart,
-        hostLength
-    );
-
-
-    host[hostLength] = '\0';
-
-
-    cout << "\n[WORKER " << threadId
-         << "] DESTINATION HOST EXTRACTED"
-         << endl;
-
-    cout << "[WORKER " << threadId
-         << "] Host: "
-         << host
-         << endl;
-
-
-    // =================================================
-    // CREATE CACHE KEY
-    // =================================================
-
-    string cacheKey;
-
-
-    if (isGetRequest)
+    if (end == string::npos)
     {
-        /*
-            Proxy request normally contains:
-
-            GET http://example.com/ HTTP/1.1
-
-            So requestTarget itself can be the cache key.
-
-            If request target is relative:
-
-            GET /index.html HTTP/1.1
-
-            then use:
-
-            http://host/index.html
-        */
-
-        if (
-            requestTarget.find("http://") == 0 ||
-            requestTarget.find("https://") == 0
-        )
-        {
-            cacheKey = requestTarget;
-        }
-        else
-        {
-            cacheKey =
-                string("http://") +
-                string(host) +
-                requestTarget;
-        }
-
-
-        cout << "\n[WORKER " << threadId
-             << "] CACHE KEY: "
-             << cacheKey
-             << endl;
+        return false;
     }
 
+    host =
+        request.substr(
+            position,
+            end - position
+        );
 
-    // =================================================
-    // CHECK CACHE
-    // =================================================
+    return !host.empty();
+}
 
-    if (isGetRequest)
+
+// =====================================================
+// PARSE HOSTNAME + PORT
+// =====================================================
+
+void parseHostAndPort(
+    const string& hostHeader,
+    string& hostname,
+    int& port
+)
+{
+    hostname = hostHeader;
+    port = 80;
+
+    size_t colon =
+        hostHeader.rfind(':');
+
+    // Port exists
+    if (
+        colon != string::npos &&
+        hostHeader.find(']') == string::npos
+    )
     {
-        string cachedResponse;
+        hostname =
+            hostHeader.substr(0, colon);
 
-
-        bool cacheHit =
-            responseCache.get(
-                cacheKey,
-                cachedResponse
+        port =
+            atoi(
+                hostHeader.substr(
+                    colon + 1
+                ).c_str()
             );
-
-
-        // =============================================
-        // CACHE HIT
-        // =============================================
-
-        if (cacheHit)
-        {
-            cout << "\n[WORKER " << threadId
-                 << "] CACHE HIT!"
-                 << endl;
-
-
-            cout << "[WORKER " << threadId
-                 << "] Sending cached response"
-                 << endl;
-
-
-            int totalSentToClient = 0;
-
-            int cachedResponseSize =
-                static_cast<int>(
-                    cachedResponse.size()
-                );
-
-
-            while (
-                totalSentToClient <
-                cachedResponseSize
-            )
-            {
-                int bytesSentToClient = send(
-                    clientSocket,
-                    cachedResponse.data() +
-                        totalSentToClient,
-                    cachedResponseSize -
-                        totalSentToClient,
-                    0
-                );
-
-
-                if (
-                    bytesSentToClient == SOCKET_ERROR ||
-                    bytesSentToClient == 0
-                )
-                {
-                    cout << "[WORKER " << threadId
-                         << "] Failed to send cached response"
-                         << endl;
-
-                    closesocket(clientSocket);
-                    return;
-                }
-
-
-                totalSentToClient +=
-                    bytesSentToClient;
-            }
-
-
-            cout << "[WORKER " << threadId
-                 << "] Cached response sent successfully"
-                 << endl;
-
-
-            closesocket(clientSocket);
-
-            return;
-        }
-
-
-        // =============================================
-        // CACHE MISS
-        // =============================================
-
-        cout << "\n[WORKER " << threadId
-             << "] CACHE MISS"
-             << endl;
-
-        cout << "[WORKER " << threadId
-             << "] Going to destination server..."
-             << endl;
     }
+}
 
 
-    // =================================================
-    // PARSE HOSTNAME AND PORT
-    // =================================================
+// =====================================================
+// CONNECT TO DESTINATION SERVER
+// =====================================================
 
-    char hostname[256];
-
-    int port = 80;
-
-
-    char* colon = strchr(
-        host,
-        ':'
-    );
-
-
-    if (colon != nullptr)
-    {
-        int hostnameLength =
-            static_cast<int>(
-                colon - host
-            );
-
-
-        if (
-            hostnameLength <= 0 ||
-            hostnameLength >=
-                static_cast<int>(
-                    sizeof(hostname)
-                )
-        )
-        {
-            cout << "[WORKER " << threadId
-                 << "] Invalid hostname"
-                 << endl;
-
-            closesocket(clientSocket);
-            return;
-        }
-
-
-        strncpy(
-            hostname,
-            host,
-            hostnameLength
-        );
-
-
-        hostname[hostnameLength] =
-            '\0';
-
-
-        port = atoi(
-            colon + 1
-        );
-
-
-        if (
-            port <= 0 ||
-            port > 65535
-        )
-        {
-            cout << "[WORKER " << threadId
-                 << "] Invalid port"
-                 << endl;
-
-            closesocket(clientSocket);
-            return;
-        }
-    }
-    else
-    {
-        strncpy(
-            hostname,
-            host,
-            sizeof(hostname) - 1
-        );
-
-
-        hostname[
-            sizeof(hostname) - 1
-        ] = '\0';
-    }
-
-
-    cout << "\n[WORKER " << threadId
-         << "] DESTINATION PARSED"
-         << endl;
-
-    cout << "[WORKER " << threadId
-         << "] Hostname: "
-         << hostname
-         << endl;
-
-    cout << "[WORKER " << threadId
-         << "] Port: "
-         << port
-         << endl;
-
-
-    // =================================================
-    // DNS RESOLUTION
-    // =================================================
+SOCKET connectToServer(
+    const string& hostname,
+    int port
+)
+{
+    cout
+        << "[PROXY] Resolving "
+        << hostname
+        << endl;
 
     addrinfo hints;
-
+    addrinfo* result = nullptr;
 
     memset(
         &hints,
@@ -524,324 +212,806 @@ void handleClient(SOCKET clientSocket)
         sizeof(hints)
     );
 
-
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
+    string portString =
+        to_string(port);
 
-    char portString[10];
+    int status =
+        getaddrinfo(
+            hostname.c_str(),
+            portString.c_str(),
+            &hints,
+            &result
+        );
 
-
-    sprintf(
-        portString,
-        "%d",
-        port
-    );
-
-
-    addrinfo* resultInfo = nullptr;
-
-
-    cout << "\n[WORKER " << threadId
-         << "] Resolving hostname..."
-         << endl;
-
-
-    int dnsResult = getaddrinfo(
-        hostname,
-        portString,
-        &hints,
-        &resultInfo
-    );
-
-
-    if (dnsResult != 0)
+    if (status != 0)
     {
-        cout << "[WORKER " << threadId
-             << "] DNS resolution failed"
-             << endl;
+        cout
+            << "[PROXY] DNS resolution failed"
+            << endl;
 
+        return INVALID_SOCKET;
+    }
+
+    SOCKET destinationSocket =
+        INVALID_SOCKET;
+
+    for (
+        addrinfo* ptr = result;
+        ptr != nullptr;
+        ptr = ptr->ai_next
+    )
+    {
+        destinationSocket =
+            socket(
+                ptr->ai_family,
+                ptr->ai_socktype,
+                ptr->ai_protocol
+            );
+
+        if (
+            destinationSocket ==
+            INVALID_SOCKET
+        )
+        {
+            continue;
+        }
+
+        if (
+            connect(
+                destinationSocket,
+                ptr->ai_addr,
+                (int)ptr->ai_addrlen
+            ) == 0
+        )
+        {
+            break;
+        }
+
+        closesocket(
+            destinationSocket
+        );
+
+        destinationSocket =
+            INVALID_SOCKET;
+    }
+
+    freeaddrinfo(result);
+
+    return destinationSocket;
+}
+
+
+// =====================================================
+// HTTPS CONNECT TUNNEL
+// =====================================================
+
+void handleConnect(
+    SOCKET clientSocket,
+    const string& request
+)
+{
+    DWORD threadId =
+        GetCurrentThreadId();
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] HTTPS CONNECT request"
+        << endl;
+
+    // -------------------------------------------------
+    // REQUEST LINE
+    //
+    // CONNECT google.com:443 HTTP/1.1
+    // -------------------------------------------------
+
+    size_t firstSpace =
+        request.find(' ');
+
+    if (firstSpace == string::npos)
+    {
         closesocket(clientSocket);
         return;
     }
 
+    size_t secondSpace =
+        request.find(
+            ' ',
+            firstSpace + 1
+        );
 
-    cout << "[WORKER " << threadId
-         << "] DNS resolution successful"
-         << endl;
+    if (secondSpace == string::npos)
+    {
+        closesocket(clientSocket);
+        return;
+    }
+
+    string target =
+        request.substr(
+            firstSpace + 1,
+            secondSpace - firstSpace - 1
+        );
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] CONNECT target: "
+        << target
+        << endl;
 
 
-    // =================================================
-    // CREATE DESTINATION SOCKET
-    // =================================================
+    // -------------------------------------------------
+    // SPLIT HOST + PORT
+    // -------------------------------------------------
 
-    SOCKET destinationSocket = socket(
-        resultInfo->ai_family,
-        resultInfo->ai_socktype,
-        resultInfo->ai_protocol
-    );
+    size_t colon =
+        target.rfind(':');
 
+    if (colon == string::npos)
+    {
+        closesocket(clientSocket);
+        return;
+    }
+
+    string hostname =
+        target.substr(
+            0,
+            colon
+        );
+
+    int port =
+        atoi(
+            target.substr(
+                colon + 1
+            ).c_str()
+        );
+
+
+    // -------------------------------------------------
+    // CONNECT TO REAL SERVER
+    // -------------------------------------------------
+
+    SOCKET destinationSocket =
+        connectToServer(
+            hostname,
+            port
+        );
 
     if (
         destinationSocket ==
         INVALID_SOCKET
     )
     {
-        cout << "[WORKER " << threadId
-             << "] Failed to create destination socket"
-             << endl;
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Could not connect to HTTPS server"
+            << endl;
 
-        freeaddrinfo(resultInfo);
+        const char* response =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Connection: close\r\n"
+            "\r\n";
 
-        closesocket(clientSocket);
-
-        return;
-    }
-
-
-    cout << "[WORKER " << threadId
-         << "] Destination socket created"
-         << endl;
-
-
-    // =================================================
-    // CONNECT TO DESTINATION SERVER
-    // =================================================
-
-    cout << "[WORKER " << threadId
-         << "] Connecting to "
-         << hostname
-         << ":"
-         << port
-         << " ..."
-         << endl;
-
-
-    int connectResult = connect(
-        destinationSocket,
-        resultInfo->ai_addr,
-        static_cast<int>(
-            resultInfo->ai_addrlen
-        )
-    );
-
-
-    // DNS result no longer required
-    freeaddrinfo(resultInfo);
-
-
-    if (connectResult == SOCKET_ERROR)
-    {
-        cout << "[WORKER " << threadId
-             << "] Connection to destination FAILED"
-             << endl;
-
-        closesocket(destinationSocket);
-        closesocket(clientSocket);
-
-        return;
-    }
-
-
-    cout << "[WORKER " << threadId
-         << "] Successfully connected to destination!"
-         << endl;
-
-
-    // =================================================
-    // FORWARD ORIGINAL REQUEST TO DESTINATION
-    // =================================================
-
-    cout << "\n[WORKER " << threadId
-         << "] Forwarding request to destination..."
-         << endl;
-
-
-    int totalSent = 0;
-
-
-    while (totalSent < bytesReceived)
-    {
-        int bytesSentToServer = send(
-            destinationSocket,
-            buffer + totalSent,
-            bytesReceived - totalSent,
-            0
+        sendAll(
+            clientSocket,
+            response,
+            (int)strlen(response)
         );
 
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    // -------------------------------------------------
+    // TELL BROWSER TUNNEL IS READY
+    // -------------------------------------------------
+
+    const char* established =
+        "HTTP/1.1 200 Connection Established\r\n"
+        "\r\n";
+
+    if (
+        !sendAll(
+            clientSocket,
+            established,
+            (int)strlen(established)
+        )
+    )
+    {
+        closesocket(destinationSocket);
+        closesocket(clientSocket);
+        return;
+    }
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] HTTPS tunnel established"
+        << endl;
+
+
+    // -------------------------------------------------
+    // BIDIRECTIONAL TCP RELAY
+    // -------------------------------------------------
+
+    char buffer[8192];
+
+    while (true)
+    {
+        fd_set readSet;
+
+        FD_ZERO(&readSet);
+
+        FD_SET(
+            clientSocket,
+            &readSet
+        );
+
+        FD_SET(
+            destinationSocket,
+            &readSet
+        );
+
+        int result =
+            select(
+                0,
+                &readSet,
+                NULL,
+                NULL,
+                NULL
+            );
+
+        if (result <= 0)
+        {
+            break;
+        }
+
+
+        // Browser -> HTTPS server
 
         if (
-            bytesSentToServer == SOCKET_ERROR ||
-            bytesSentToServer == 0
+            FD_ISSET(
+                clientSocket,
+                &readSet
+            )
         )
         {
-            cout << "[WORKER " << threadId
-                 << "] Failed to forward request"
-                 << endl;
+            int bytes =
+                recv(
+                    clientSocket,
+                    buffer,
+                    sizeof(buffer),
+                    0
+                );
 
-            closesocket(destinationSocket);
-            closesocket(clientSocket);
+            if (bytes <= 0)
+            {
+                break;
+            }
+
+            if (
+                !sendAll(
+                    destinationSocket,
+                    buffer,
+                    bytes
+                )
+            )
+            {
+                break;
+            }
+        }
+
+
+        // HTTPS server -> Browser
+
+        if (
+            FD_ISSET(
+                destinationSocket,
+                &readSet
+            )
+        )
+        {
+            int bytes =
+                recv(
+                    destinationSocket,
+                    buffer,
+                    sizeof(buffer),
+                    0
+                );
+
+            if (bytes <= 0)
+            {
+                break;
+            }
+
+            if (
+                !sendAll(
+                    clientSocket,
+                    buffer,
+                    bytes
+                )
+            )
+            {
+                break;
+            }
+        }
+    }
+
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] HTTPS tunnel closed"
+        << endl;
+
+
+    closesocket(
+        destinationSocket
+    );
+
+    closesocket(
+        clientSocket
+    );
+}
+
+
+// =====================================================
+// NORMAL HTTP REQUEST
+// =====================================================
+
+void handleHttp(
+    SOCKET clientSocket,
+    const string& request
+)
+{
+    DWORD threadId =
+        GetCurrentThreadId();
+
+
+    // =================================================
+    // GET REQUEST CHECK
+    // =================================================
+
+    bool isGetRequest =
+        request.compare(
+            0,
+            4,
+            "GET "
+        ) == 0;
+
+
+    // =================================================
+    // EXTRACT REQUEST TARGET
+    // =================================================
+
+    string requestTarget;
+
+    size_t firstSpace =
+        request.find(' ');
+
+    if (firstSpace != string::npos)
+    {
+        size_t secondSpace =
+            request.find(
+                ' ',
+                firstSpace + 1
+            );
+
+        if (
+            secondSpace !=
+            string::npos
+        )
+        {
+            requestTarget =
+                request.substr(
+                    firstSpace + 1,
+                    secondSpace - firstSpace - 1
+                );
+        }
+    }
+
+
+    // =================================================
+    // EXTRACT HOST
+    // =================================================
+
+    string host;
+
+    if (
+        !extractHost(
+            request,
+            host
+        )
+    )
+    {
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Host header not found"
+            << endl;
+
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Host: "
+        << host
+        << endl;
+
+
+    // =================================================
+    // CACHE KEY
+    // =================================================
+
+    string cacheKey;
+
+    if (
+        requestTarget.find("http://") == 0 ||
+        requestTarget.find("https://") == 0
+    )
+    {
+        cacheKey =
+            requestTarget;
+    }
+    else
+    {
+        cacheKey =
+            "http://" +
+            host +
+            requestTarget;
+    }
+
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] CACHE KEY: "
+        << cacheKey
+        << endl;
+
+
+    // =================================================
+    // CACHE CHECK
+    // =================================================
+
+    if (isGetRequest)
+    {
+        string cachedResponse;
+
+        bool cacheHit =
+            responseCache.get(
+                cacheKey,
+                cachedResponse
+            );
+
+        if (cacheHit)
+        {
+            cout
+                << "[WORKER "
+                << threadId
+                << "] CACHE HIT!"
+                << endl;
+
+            bool sent =
+                sendAll(
+                    clientSocket,
+                    cachedResponse.data(),
+                    (int)cachedResponse.size()
+                );
+
+            if (sent)
+            {
+                cout
+                    << "[WORKER "
+                    << threadId
+                    << "] Cached response sent"
+                    << endl;
+            }
+
+            closesocket(
+                clientSocket
+            );
 
             return;
         }
 
-
-        totalSent +=
-            bytesSentToServer;
+        cout
+            << "[WORKER "
+            << threadId
+            << "] CACHE MISS"
+            << endl;
     }
 
 
-    cout << "[WORKER " << threadId
-         << "] Request successfully forwarded!"
-         << endl;
+    // =================================================
+    // PARSE DESTINATION
+    // =================================================
+
+    string hostname;
+    int port;
+
+    parseHostAndPort(
+        host,
+        hostname,
+        port
+    );
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Hostname: "
+        << hostname
+        << endl;
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Port: "
+        << port
+        << endl;
 
 
     // =================================================
-    // RECEIVE RESPONSE FROM DESTINATION
-    // AND FORWARD IT TO CLIENT
+    // CONNECT TO DESTINATION
     // =================================================
 
-    cout << "\n[WORKER " << threadId
-         << "] Waiting for destination response..."
-         << endl;
+    SOCKET destinationSocket =
+        connectToServer(
+            hostname,
+            port
+        );
 
+    if (
+        destinationSocket ==
+        INVALID_SOCKET
+    )
+    {
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Destination connection failed"
+            << endl;
+
+        const char* response =
+            "HTTP/1.1 502 Bad Gateway\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        sendAll(
+            clientSocket,
+            response,
+            (int)strlen(response)
+        );
+
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    // =================================================
+    // FORCE DESTINATION CONNECTION CLOSE
+    //
+    // This makes response completion predictable.
+    // =================================================
+
+    string modifiedRequest =
+        request;
+
+    size_t connectionPos =
+        modifiedRequest.find(
+            "\r\nConnection:"
+        );
+
+    if (
+        connectionPos != string::npos
+    )
+    {
+        size_t lineEnd =
+            modifiedRequest.find(
+                "\r\n",
+                connectionPos + 2
+            );
+
+        if (lineEnd != string::npos)
+        {
+            modifiedRequest.replace(
+                connectionPos,
+                lineEnd - connectionPos,
+                "\r\nConnection: close"
+            );
+        }
+    }
+    else
+    {
+        size_t headerEnd =
+            modifiedRequest.find(
+                "\r\n\r\n"
+            );
+
+        if (headerEnd != string::npos)
+        {
+            modifiedRequest.insert(
+                headerEnd,
+                "\r\nConnection: close"
+            );
+        }
+    }
+
+
+    // =================================================
+    // REMOVE PROXY-CONNECTION HEADER
+    // =================================================
+
+    size_t proxyConnectionPos =
+        modifiedRequest.find(
+            "\r\nProxy-Connection:"
+        );
+
+    if (
+        proxyConnectionPos !=
+        string::npos
+    )
+    {
+        size_t lineEnd =
+            modifiedRequest.find(
+                "\r\n",
+                proxyConnectionPos + 2
+            );
+
+        if (lineEnd != string::npos)
+        {
+            modifiedRequest.erase(
+                proxyConnectionPos,
+                lineEnd - proxyConnectionPos
+            );
+        }
+    }
+
+
+    // =================================================
+    // FORWARD REQUEST
+    // =================================================
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Forwarding request..."
+        << endl;
+
+    if (
+        !sendAll(
+            destinationSocket,
+            modifiedRequest.data(),
+            (int)modifiedRequest.size()
+        )
+    )
+    {
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Request forwarding failed"
+            << endl;
+
+        closesocket(destinationSocket);
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Request forwarded successfully"
+        << endl;
+
+
+    // =================================================
+    // RECEIVE + RELAY RESPONSE
+    // =================================================
 
     char responseBuffer[8192];
 
-
-    // =================================================
-    // FULL RESPONSE FOR CACHE
-    // =================================================
-
     string fullResponse;
 
-
-    // If this becomes false, we will NOT cache response
-    bool responseRelaySuccessful = true;
-
+    bool relaySuccessful = true;
 
     while (true)
     {
-        // =============================================
-        // RECEIVE RESPONSE CHUNK
-        // =============================================
-
-        int bytesReceivedFromServer = recv(
-            destinationSocket,
-            responseBuffer,
-            sizeof(responseBuffer),
-            0
-        );
+        int bytesReceived =
+            recv(
+                destinationSocket,
+                responseBuffer,
+                sizeof(responseBuffer),
+                0
+            );
 
 
-        // Destination closed connection
-        if (bytesReceivedFromServer == 0)
+        // Destination closed
+
+        if (bytesReceived == 0)
         {
-            cout << "[WORKER " << threadId
-                 << "] Destination server closed connection"
-                 << endl;
+            cout
+                << "[WORKER "
+                << threadId
+                << "] Destination closed connection"
+                << endl;
 
             break;
         }
 
 
-        if (bytesReceivedFromServer == SOCKET_ERROR)
+        // Error
+
+        if (
+            bytesReceived ==
+            SOCKET_ERROR
+        )
         {
-            cout << "[WORKER " << threadId
-                 << "] Error receiving response"
-                 << endl;
+            cout
+                << "[WORKER "
+                << threadId
+                << "] Response receive failed"
+                << endl;
 
-            responseRelaySuccessful = false;
-
+            relaySuccessful = false;
             break;
         }
 
 
-        cout << "[WORKER " << threadId
-             << "] Received "
-             << bytesReceivedFromServer
-             << " bytes from destination"
-             << endl;
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Received "
+            << bytesReceived
+            << " bytes"
+            << endl;
 
 
-        // =============================================
-        // SAVE RESPONSE FOR CACHE
-        // =============================================
+        // -------------------------------------------------
+        // SAVE COMPLETE RESPONSE FOR CACHE
+        // -------------------------------------------------
 
         if (isGetRequest)
         {
             fullResponse.append(
                 responseBuffer,
-                bytesReceivedFromServer
+                bytesReceived
             );
         }
 
 
-        // =============================================
-        // FORWARD RESPONSE CHUNK TO CLIENT
-        // =============================================
+        // -------------------------------------------------
+        // SEND RESPONSE TO BROWSER
+        // -------------------------------------------------
 
-        int totalSentToClient = 0;
-
-
-        while (
-            totalSentToClient <
-            bytesReceivedFromServer
-        )
-        {
-            int bytesSentToClient = send(
-                clientSocket,
-                responseBuffer +
-                    totalSentToClient,
-                bytesReceivedFromServer -
-                    totalSentToClient,
-                0
-            );
-
-
-            if (
-                bytesSentToClient == SOCKET_ERROR ||
-                bytesSentToClient == 0
-            )
-            {
-                cout << "[WORKER " << threadId
-                     << "] Failed to forward response to client"
-                     << endl;
-
-                responseRelaySuccessful = false;
-
-                break;
-            }
-
-
-            totalSentToClient +=
-                bytesSentToClient;
-        }
-
-
-        // Could not forward complete response
         if (
-            totalSentToClient <
-            bytesReceivedFromServer
+            !sendAll(
+                clientSocket,
+                responseBuffer,
+                bytesReceived
+            )
         )
         {
-            cout << "[WORKER " << threadId
-                 << "] Response relay stopped"
-                 << endl;
+            cout
+                << "[WORKER "
+                << threadId
+                << "] Failed sending response to client"
+                << endl;
 
+            relaySuccessful = false;
             break;
         }
-
-
-        cout << "[WORKER " << threadId
-             << "] Response chunk forwarded to client"
-             << endl;
     }
-
-
-    cout << "\n[WORKER " << threadId
-         << "] Response relay finished"
-         << endl;
 
 
     // =================================================
@@ -850,24 +1020,26 @@ void handleClient(SOCKET clientSocket)
 
     if (
         isGetRequest &&
-        responseRelaySuccessful &&
+        relaySuccessful &&
         !fullResponse.empty()
     )
     {
-        cout << "\n[WORKER " << threadId
-             << "] Storing response in cache..."
-             << endl;
-
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Storing response in cache..."
+            << endl;
 
         responseCache.put(
             cacheKey,
             fullResponse
         );
 
-
-        cout << "[WORKER " << threadId
-             << "] Response stored in cache"
-             << endl;
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Response stored in cache"
+            << endl;
     }
 
 
@@ -879,13 +1051,118 @@ void handleClient(SOCKET clientSocket)
         destinationSocket
     );
 
-
     closesocket(
         clientSocket
     );
 
+    cout
+        << "[WORKER "
+        << threadId
+        << "] HTTP request finished"
+        << endl;
+}
 
-    cout << "[WORKER " << threadId
-         << "] Client and destination connections closed"
-         << endl;
+
+// =====================================================
+// MAIN CLIENT HANDLER
+// =====================================================
+
+void handleClient(
+    SOCKET clientSocket
+)
+{
+    DWORD threadId =
+        GetCurrentThreadId();
+
+    cout
+        << "\n====================================="
+        << endl;
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] Handling client"
+        << endl;
+
+    cout
+        << "====================================="
+        << endl;
+
+
+    // =================================================
+    // RECEIVE COMPLETE HTTP REQUEST
+    // =================================================
+
+    string request;
+
+    if (
+        !receiveHttpRequest(
+            clientSocket,
+            request
+        )
+    )
+    {
+        cout
+            << "[WORKER "
+            << threadId
+            << "] Failed to receive request"
+            << endl;
+
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    // =================================================
+    // PRINT REQUEST
+    // =================================================
+
+    cout
+        << "[WORKER "
+        << threadId
+        << "] REQUEST RECEIVED"
+        << endl;
+
+    cout
+        << "-------------------------------------"
+        << endl;
+
+    cout
+        << request
+        << endl;
+
+    cout
+        << "-------------------------------------"
+        << endl;
+
+
+    // =================================================
+    // CHECK CONNECT
+    // =================================================
+
+    if (
+        request.compare(
+            0,
+            8,
+            "CONNECT "
+        ) == 0
+    )
+    {
+        handleConnect(
+            clientSocket,
+            request
+        );
+
+        return;
+    }
+
+
+    // =================================================
+    // NORMAL HTTP
+    // =================================================
+
+    handleHttp(
+        clientSocket,
+        request
+    );
 }
