@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <sstream>
+#include <chrono>
 using namespace std;
 
 
@@ -195,13 +196,17 @@ void parseHostAndPort(
 
 SOCKET connectToServer(
     const string& hostname,
-    int port
+    int port,
+    bool logResolution = true
 )
 {
-    cout
-        << "[PROXY] Resolving "
-        << hostname
-        << endl;
+    if (logResolution)
+    {
+        cout
+            << "[PROXY] Resolving "
+            << hostname
+            << endl;
+    }
 
     addrinfo hints;
     addrinfo* result = nullptr;
@@ -297,12 +302,6 @@ void handleConnect(
     DWORD threadId =
         GetCurrentThreadId();
 
-    cout
-        << "[WORKER "
-        << threadId
-        << "] HTTPS CONNECT request"
-        << endl;
-
     // -------------------------------------------------
     // REQUEST LINE
     //
@@ -335,14 +334,6 @@ void handleConnect(
             firstSpace + 1,
             secondSpace - firstSpace - 1
         );
-
-    cout
-        << "[WORKER "
-        << threadId
-        << "] CONNECT target: "
-        << target
-        << endl;
-
 
     // -------------------------------------------------
     // SPLIT HOST + PORT
@@ -378,7 +369,8 @@ void handleConnect(
     SOCKET destinationSocket =
         connectToServer(
             hostname,
-            port
+            port,
+            false
         );
 
     if (
@@ -428,13 +420,6 @@ void handleConnect(
         closesocket(clientSocket);
         return;
     }
-
-    cout
-        << "[WORKER "
-        << threadId
-        << "] HTTPS tunnel established"
-        << endl;
-
 
     // -------------------------------------------------
     // BIDIRECTIONAL TCP RELAY
@@ -572,6 +557,9 @@ void handleHttp(
 {
     DWORD threadId =
         GetCurrentThreadId();
+
+    auto startTime =
+        chrono::high_resolution_clock::now();
 
 
     // =================================================
@@ -715,6 +703,20 @@ void handleHttp(
                     << "[WORKER "
                     << threadId
                     << "] Cached response sent"
+                    << endl;
+
+                auto endTime =
+                    chrono::high_resolution_clock::now();
+
+                auto duration =
+                    chrono::duration_cast<chrono::milliseconds>(
+                        endTime - startTime
+                    ).count();
+
+                cout
+                    << "[CACHE] HIT - Response time: "
+                    << duration
+                    << " ms"
                     << endl;
             }
 
@@ -1040,6 +1042,20 @@ void handleHttp(
             << threadId
             << "] Response stored in cache"
             << endl;
+
+        auto endTime =
+            chrono::high_resolution_clock::now();
+
+        auto duration =
+            chrono::duration_cast<chrono::milliseconds>(
+                endTime - startTime
+            ).count();
+
+        cout
+            << "[CACHE] MISS - Response time: "
+            << duration
+            << " ms"
+            << endl;
     }
 
 
@@ -1117,23 +1133,40 @@ void handleClient(
     // PRINT REQUEST
     // =================================================
 
-    cout
-        << "[WORKER "
-        << threadId
-        << "] REQUEST RECEIVED"
-        << endl;
+    // =================================================
+    // CHECK CONNECT
+    // =================================================
 
-    cout
-        << "-------------------------------------"
-        << endl;
+    bool isConnectRequest =
+        request.compare(
+            0,
+            8,
+            "CONNECT "
+        ) == 0;
 
-    cout
-        << request
-        << endl;
+    // Browser creates many background HTTPS CONNECT requests.
+    // Do not print their full contents in the terminal.
 
-    cout
-        << "-------------------------------------"
-        << endl;
+    if (!isConnectRequest)
+    {
+        cout
+            << "[WORKER "
+            << threadId
+            << "] REQUEST RECEIVED"
+            << endl;
+
+        cout
+            << "-------------------------------------"
+            << endl;
+
+        cout
+            << request
+            << endl;
+
+        cout
+            << "-------------------------------------"
+            << endl;
+    }
 
 
     // =================================================
