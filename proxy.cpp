@@ -1,7 +1,5 @@
 #define _WIN32_WINNT 0x0600
 
-#include "proxy.h"
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -9,9 +7,25 @@
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+
+#include "proxy.h"
+#include "cache.h"
 
 using namespace std;
 
+
+// =====================================================
+// LRU RESPONSE CACHE
+// =====================================================
+
+// Maximum 5 responses
+LRUCache responseCache(5);
+
+
+// =====================================================
+// HANDLE CLIENT
+// =====================================================
 
 void handleClient(SOCKET clientSocket)
 {
@@ -58,11 +72,7 @@ void handleClient(SOCKET clientSocket)
     }
 
 
-    // Add null terminator only for parsing/printing.
-    //
-    // bytesReceived still represents the real number
-    // of bytes that must be forwarded.
-
+    // Null terminator only for parsing/printing
     buffer[bytesReceived] = '\0';
 
 
@@ -76,6 +86,72 @@ void handleClient(SOCKET clientSocket)
 
 
     // =================================================
+    // CHECK HTTP METHOD AND EXTRACT REQUEST TARGET
+    // =================================================
+
+    string request(
+        buffer,
+        bytesReceived
+    );
+
+    bool isGetRequest = false;
+
+    string requestTarget;
+
+
+    // Find first line
+    size_t firstLineEnd = request.find(
+        "\r\n"
+    );
+
+
+    if (firstLineEnd != string::npos)
+    {
+        string requestLine =
+            request.substr(
+                0,
+                firstLineEnd
+            );
+
+        // Find first space
+        size_t firstSpace =
+            requestLine.find(' ');
+
+        // Find second space
+        size_t secondSpace =
+            requestLine.find(
+                ' ',
+                firstSpace + 1
+            );
+
+
+        if (
+            firstSpace != string::npos &&
+            secondSpace != string::npos
+        )
+        {
+            string method =
+                requestLine.substr(
+                    0,
+                    firstSpace
+                );
+
+            requestTarget =
+                requestLine.substr(
+                    firstSpace + 1,
+                    secondSpace - firstSpace - 1
+                );
+
+
+            if (method == "GET")
+            {
+                isGetRequest = true;
+            }
+        }
+    }
+
+
+    // =================================================
     // EXTRACT HOST HEADER
     // =================================================
 
@@ -85,7 +161,7 @@ void handleClient(SOCKET clientSocket)
     );
 
 
-    // In case Host happens to be at the start.
+    // In case Host happens to be at the start
     if (hostStart == nullptr)
     {
         if (strncmp(buffer, "Host:", 5) == 0)
@@ -117,14 +193,14 @@ void handleClient(SOCKET clientSocket)
     }
 
 
-    // Skip spaces after Host:
+    // Skip spaces
     while (*hostStart == ' ')
     {
         hostStart++;
     }
 
 
-    // Find the end of Host header.
+    // Find end of Host header
     const char* hostEnd = strstr(
         hostStart,
         "\r\n"
@@ -146,15 +222,19 @@ void handleClient(SOCKET clientSocket)
     // COPY HOST VALUE
     // =================================================
 
-    int hostLength = static_cast<int>(
-        hostEnd - hostStart
-    );
+    int hostLength =
+        static_cast<int>(
+            hostEnd - hostStart
+        );
 
 
     char host[256];
 
 
-    if (hostLength >= static_cast<int>(sizeof(host)))
+    if (
+        hostLength >=
+        static_cast<int>(sizeof(host))
+    )
     {
         cout << "[WORKER " << threadId
              << "] Host header too large"
@@ -186,6 +266,153 @@ void handleClient(SOCKET clientSocket)
 
 
     // =================================================
+    // CREATE CACHE KEY
+    // =================================================
+
+    string cacheKey;
+
+
+    if (isGetRequest)
+    {
+        /*
+            Proxy request normally contains:
+
+            GET http://example.com/ HTTP/1.1
+
+            So requestTarget itself can be the cache key.
+
+            If request target is relative:
+
+            GET /index.html HTTP/1.1
+
+            then use:
+
+            http://host/index.html
+        */
+
+        if (
+            requestTarget.find("http://") == 0 ||
+            requestTarget.find("https://") == 0
+        )
+        {
+            cacheKey = requestTarget;
+        }
+        else
+        {
+            cacheKey =
+                string("http://") +
+                string(host) +
+                requestTarget;
+        }
+
+
+        cout << "\n[WORKER " << threadId
+             << "] CACHE KEY: "
+             << cacheKey
+             << endl;
+    }
+
+
+    // =================================================
+    // CHECK CACHE
+    // =================================================
+
+    if (isGetRequest)
+    {
+        string cachedResponse;
+
+
+        bool cacheHit =
+            responseCache.get(
+                cacheKey,
+                cachedResponse
+            );
+
+
+        // =============================================
+        // CACHE HIT
+        // =============================================
+
+        if (cacheHit)
+        {
+            cout << "\n[WORKER " << threadId
+                 << "] CACHE HIT!"
+                 << endl;
+
+
+            cout << "[WORKER " << threadId
+                 << "] Sending cached response"
+                 << endl;
+
+
+            int totalSentToClient = 0;
+
+            int cachedResponseSize =
+                static_cast<int>(
+                    cachedResponse.size()
+                );
+
+
+            while (
+                totalSentToClient <
+                cachedResponseSize
+            )
+            {
+                int bytesSentToClient = send(
+                    clientSocket,
+                    cachedResponse.data() +
+                        totalSentToClient,
+                    cachedResponseSize -
+                        totalSentToClient,
+                    0
+                );
+
+
+                if (
+                    bytesSentToClient == SOCKET_ERROR ||
+                    bytesSentToClient == 0
+                )
+                {
+                    cout << "[WORKER " << threadId
+                         << "] Failed to send cached response"
+                         << endl;
+
+                    closesocket(clientSocket);
+                    return;
+                }
+
+
+                totalSentToClient +=
+                    bytesSentToClient;
+            }
+
+
+            cout << "[WORKER " << threadId
+                 << "] Cached response sent successfully"
+                 << endl;
+
+
+            closesocket(clientSocket);
+
+            return;
+        }
+
+
+        // =============================================
+        // CACHE MISS
+        // =============================================
+
+        cout << "\n[WORKER " << threadId
+             << "] CACHE MISS"
+             << endl;
+
+        cout << "[WORKER " << threadId
+             << "] Going to destination server..."
+             << endl;
+    }
+
+
+    // =================================================
     // PARSE HOSTNAME AND PORT
     // =================================================
 
@@ -202,16 +429,18 @@ void handleClient(SOCKET clientSocket)
 
     if (colon != nullptr)
     {
-        int hostnameLength = static_cast<int>(
-            colon - host
-        );
+        int hostnameLength =
+            static_cast<int>(
+                colon - host
+            );
 
 
         if (
             hostnameLength <= 0 ||
-            hostnameLength >= static_cast<int>(
-                sizeof(hostname)
-            )
+            hostnameLength >=
+                static_cast<int>(
+                    sizeof(hostname)
+                )
         )
         {
             cout << "[WORKER " << threadId
@@ -230,7 +459,8 @@ void handleClient(SOCKET clientSocket)
         );
 
 
-        hostname[hostnameLength] = '\0';
+        hostname[hostnameLength] =
+            '\0';
 
 
         port = atoi(
@@ -238,7 +468,10 @@ void handleClient(SOCKET clientSocket)
         );
 
 
-        if (port <= 0 || port > 65535)
+        if (
+            port <= 0 ||
+            port > 65535
+        )
         {
             cout << "[WORKER " << threadId
                  << "] Invalid port"
@@ -284,6 +517,7 @@ void handleClient(SOCKET clientSocket)
 
     addrinfo hints;
 
+
     memset(
         &hints,
         0,
@@ -296,6 +530,7 @@ void handleClient(SOCKET clientSocket)
 
 
     char portString[10];
+
 
     sprintf(
         portString,
@@ -347,7 +582,10 @@ void handleClient(SOCKET clientSocket)
     );
 
 
-    if (destinationSocket == INVALID_SOCKET)
+    if (
+        destinationSocket ==
+        INVALID_SOCKET
+    )
     {
         cout << "[WORKER " << threadId
              << "] Failed to create destination socket"
@@ -388,7 +626,7 @@ void handleClient(SOCKET clientSocket)
     );
 
 
-    // DNS result no longer required after connect().
+    // DNS result no longer required
     freeaddrinfo(resultInfo);
 
 
@@ -448,7 +686,8 @@ void handleClient(SOCKET clientSocket)
         }
 
 
-        totalSent += bytesSentToServer;
+        totalSent +=
+            bytesSentToServer;
     }
 
 
@@ -470,6 +709,17 @@ void handleClient(SOCKET clientSocket)
     char responseBuffer[8192];
 
 
+    // =================================================
+    // FULL RESPONSE FOR CACHE
+    // =================================================
+
+    string fullResponse;
+
+
+    // If this becomes false, we will NOT cache response
+    bool responseRelaySuccessful = true;
+
+
     while (true)
     {
         // =============================================
@@ -484,7 +734,7 @@ void handleClient(SOCKET clientSocket)
         );
 
 
-        // Destination closed connection.
+        // Destination closed connection
         if (bytesReceivedFromServer == 0)
         {
             cout << "[WORKER " << threadId
@@ -501,6 +751,8 @@ void handleClient(SOCKET clientSocket)
                  << "] Error receiving response"
                  << endl;
 
+            responseRelaySuccessful = false;
+
             break;
         }
 
@@ -513,7 +765,20 @@ void handleClient(SOCKET clientSocket)
 
 
         // =============================================
-        // FORWARD ENTIRE RESPONSE CHUNK TO CLIENT
+        // SAVE RESPONSE FOR CACHE
+        // =============================================
+
+        if (isGetRequest)
+        {
+            fullResponse.append(
+                responseBuffer,
+                bytesReceivedFromServer
+            );
+        }
+
+
+        // =============================================
+        // FORWARD RESPONSE CHUNK TO CLIENT
         // =============================================
 
         int totalSentToClient = 0;
@@ -526,7 +791,8 @@ void handleClient(SOCKET clientSocket)
         {
             int bytesSentToClient = send(
                 clientSocket,
-                responseBuffer + totalSentToClient,
+                responseBuffer +
+                    totalSentToClient,
                 bytesReceivedFromServer -
                     totalSentToClient,
                 0
@@ -542,6 +808,8 @@ void handleClient(SOCKET clientSocket)
                      << "] Failed to forward response to client"
                      << endl;
 
+                responseRelaySuccessful = false;
+
                 break;
             }
 
@@ -551,7 +819,7 @@ void handleClient(SOCKET clientSocket)
         }
 
 
-        // Could not forward complete response.
+        // Could not forward complete response
         if (
             totalSentToClient <
             bytesReceivedFromServer
@@ -574,6 +842,33 @@ void handleClient(SOCKET clientSocket)
     cout << "\n[WORKER " << threadId
          << "] Response relay finished"
          << endl;
+
+
+    // =================================================
+    // STORE RESPONSE IN CACHE
+    // =================================================
+
+    if (
+        isGetRequest &&
+        responseRelaySuccessful &&
+        !fullResponse.empty()
+    )
+    {
+        cout << "\n[WORKER " << threadId
+             << "] Storing response in cache..."
+             << endl;
+
+
+        responseCache.put(
+            cacheKey,
+            fullResponse
+        );
+
+
+        cout << "[WORKER " << threadId
+             << "] Response stored in cache"
+             << endl;
+    }
 
 
     // =================================================
