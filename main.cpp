@@ -11,35 +11,47 @@
 
 using namespace std;
 
+
 // =====================================================
 // CONFIGURATION
 // =====================================================
 
 const int WORKER_COUNT = 3;
-const int MAX_QUEUE_SIZE = 10;
+const int MAX_QUEUE_SIZE = 5;
 
 
 // =====================================================
 // SHARED RESOURCES
 // =====================================================
 
-// Shared queue containing accepted client sockets
+// Shared bounded queue containing accepted client sockets
 queue<SOCKET> clientQueue;
 
 
-// Mutex protects all queue operations:
-// push(), pop(), front(), size()
+// Mutex protects clientQueue and everything directly
+// related to accessing/modifying it.
 HANDLE queueMutex;
 
 
-// Counts available clients in queue.
-// Workers wait on this semaphore.
+// Counts how many clients are available in the queue.
+//
+// Initial value = 0
+//
+// Producer (main thread):
+//      ReleaseSemaphore(clientAvailable)
+//
+// Consumer (worker):
+//      WaitForSingleObject(clientAvailable)
 HANDLE clientAvailable;
 
 
-// Counts free slots in bounded queue.
-// Main thread waits when queue is full.
-HANDLE queueSlots;
+// Counts how many empty slots are available in the queue.
+//
+// Initial value = MAX_QUEUE_SIZE
+//
+// Producer waits before inserting.
+// Consumer releases one slot after removing.
+HANDLE emptySlots;
 
 
 // =====================================================
@@ -51,60 +63,60 @@ void handleClient(SOCKET clientSocket)
     DWORD threadId = GetCurrentThreadId();
 
     cout << "\n=====================================" << endl;
-
-    cout << "[WORKER " << threadId
-         << "] Handling client"
-         << endl;
-
-    cout << "====================================="
-         << endl;
+    cout << "[WORKER " << threadId << "] Handling client" << endl;
+    cout << "=====================================" << endl;
 
 
     // =================================================
-    // RECEIVE HTTP REQUEST
+    // RECEIVE HTTP REQUEST FROM CLIENT
     // =================================================
 
     char buffer[4096];
 
-
     int bytesReceived = recv(
-
         clientSocket,
         buffer,
         sizeof(buffer) - 1,
         0
-
     );
 
 
-    if (bytesReceived <= 0)
+    if (bytesReceived == 0)
     {
         cout << "[WORKER " << threadId
-             << "] Client disconnected or recv failed"
+             << "] Client disconnected"
              << endl;
 
-
         closesocket(clientSocket);
-
         return;
     }
 
 
-    // Null terminate received request
+    if (bytesReceived == SOCKET_ERROR)
+    {
+        cout << "[WORKER " << threadId
+             << "] recv() failed"
+             << endl;
+
+        closesocket(clientSocket);
+        return;
+    }
+
+
+    // Add null terminator only for parsing/printing.
+    //
+    // bytesReceived still represents the real number
+    // of bytes that must be forwarded.
     buffer[bytesReceived] = '\0';
 
 
     cout << "\n[WORKER " << threadId
-         << "] Request received:"
+         << "] REQUEST RECEIVED"
          << endl;
 
-    cout << "-------------------------------------"
-         << endl;
-
+    cout << "-------------------------------------" << endl;
     cout << buffer << endl;
-
-    cout << "-------------------------------------"
-         << endl;
+    cout << "-------------------------------------" << endl;
 
 
     // =================================================
@@ -112,14 +124,12 @@ void handleClient(SOCKET clientSocket)
     // =================================================
 
     const char* hostStart = strstr(
-
         buffer,
         "\r\nHost:"
-
     );
 
 
-    // Handle case where Host happens to be at beginning
+    // In case Host happens to be at the start.
     if (hostStart == nullptr)
     {
         if (strncmp(buffer, "Host:", 5) == 0)
@@ -135,9 +145,7 @@ void handleClient(SOCKET clientSocket)
              << "] Host header not found"
              << endl;
 
-
         closesocket(clientSocket);
-
         return;
     }
 
@@ -160,12 +168,10 @@ void handleClient(SOCKET clientSocket)
     }
 
 
-    // Find end of Host line
+    // Find the end of Host header.
     const char* hostEnd = strstr(
-
         hostStart,
         "\r\n"
-
     );
 
 
@@ -175,9 +181,7 @@ void handleClient(SOCKET clientSocket)
              << "] Invalid Host header"
              << endl;
 
-
         closesocket(clientSocket);
-
         return;
     }
 
@@ -186,24 +190,29 @@ void handleClient(SOCKET clientSocket)
     // COPY HOST VALUE
     // =================================================
 
-    int hostLength = hostEnd - hostStart;
+    int hostLength = static_cast<int>(
+        hostEnd - hostStart
+    );
 
 
     char host[256];
 
 
-    if (hostLength >= 255)
+    if (hostLength >= static_cast<int>(sizeof(host)))
     {
-        hostLength = 255;
+        cout << "[WORKER " << threadId
+             << "] Host header too large"
+             << endl;
+
+        closesocket(clientSocket);
+        return;
     }
 
 
     strncpy(
-
         host,
         hostStart,
         hostLength
-
     );
 
 
@@ -229,62 +238,72 @@ void handleClient(SOCKET clientSocket)
     int port = 80;
 
 
-    // Look for :port
     char* colon = strchr(
-
         host,
         ':'
-
     );
 
 
     if (colon != nullptr)
     {
-        // Host contains hostname:port
+        int hostnameLength = static_cast<int>(
+            colon - host
+        );
 
-        int hostnameLength = colon - host;
 
-
-        if (hostnameLength >= 255)
+        if (
+            hostnameLength <= 0 ||
+            hostnameLength >= static_cast<int>(
+                sizeof(hostname)
+            )
+        )
         {
-            hostnameLength = 255;
+            cout << "[WORKER " << threadId
+                 << "] Invalid hostname"
+                 << endl;
+
+            closesocket(clientSocket);
+            return;
         }
 
 
         strncpy(
-
             hostname,
             host,
             hostnameLength
-
         );
 
 
         hostname[hostnameLength] = '\0';
 
 
-        // Convert port text to integer
         port = atoi(
-
             colon + 1
-
         );
+
+
+        if (port <= 0 || port > 65535)
+        {
+            cout << "[WORKER " << threadId
+                 << "] Invalid port"
+                 << endl;
+
+            closesocket(clientSocket);
+            return;
+        }
     }
     else
     {
-        // No port specified.
-        // Default HTTP port = 80.
-
         strncpy(
-
             hostname,
             host,
             sizeof(hostname) - 1
-
         );
 
 
-        hostname[sizeof(hostname) - 1] = '\0';
+        hostname[
+            sizeof(hostname) - 1
+        ] = '\0';
     }
 
 
@@ -307,88 +326,68 @@ void handleClient(SOCKET clientSocket)
     // DNS RESOLUTION
     // =================================================
 
+    addrinfo hints;
+
+    memset(
+        &hints,
+        0,
+        sizeof(hints)
+    );
+
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+
+    char portString[10];
+
+    sprintf(
+        portString,
+        "%d",
+        port
+    );
+
+
+    addrinfo* resultInfo = nullptr;
+
+
     cout << "\n[WORKER " << threadId
          << "] Resolving hostname..."
          << endl;
 
 
-    addrinfo hints;
-
-
-    memset(
-
-        &hints,
-        0,
-        sizeof(hints)
-
-    );
-
-
-    // IPv4
-    hints.ai_family = AF_INET;
-
-    // TCP
-    hints.ai_socktype = SOCK_STREAM;
-
-
-    // Convert port integer to string
-    char portString[10];
-
-
-    sprintf(
-
-        portString,
-        "%d",
-        port
-
-    );
-
-
-    // Pointer where DNS result will be stored
-    addrinfo* resultInfo = nullptr;
-
-
     int dnsResult = getaddrinfo(
-
         hostname,
         portString,
         &hints,
         &resultInfo
-
     );
 
 
     if (dnsResult != 0)
     {
         cout << "[WORKER " << threadId
-             << "] DNS resolution failed for: "
-             << hostname
+             << "] DNS resolution failed"
              << endl;
 
-
         closesocket(clientSocket);
-
         return;
     }
 
 
     cout << "[WORKER " << threadId
-         << "] Hostname resolved successfully"
+         << "] DNS resolution successful"
          << endl;
 
-
-   
 
     // =================================================
     // CREATE DESTINATION SOCKET
     // =================================================
 
     SOCKET destinationSocket = socket(
-
         resultInfo->ai_family,
         resultInfo->ai_socktype,
         resultInfo->ai_protocol
-
     );
 
 
@@ -397,7 +396,6 @@ void handleClient(SOCKET clientSocket)
         cout << "[WORKER " << threadId
              << "] Failed to create destination socket"
              << endl;
-
 
         freeaddrinfo(resultInfo);
 
@@ -426,17 +424,15 @@ void handleClient(SOCKET clientSocket)
 
 
     int connectResult = connect(
-
         destinationSocket,
-
         resultInfo->ai_addr,
-
-        resultInfo->ai_addrlen
-
+        static_cast<int>(
+            resultInfo->ai_addrlen
+        )
     );
 
 
-    // DNS address information is no longer needed
+    // DNS result no longer required after connect().
     freeaddrinfo(resultInfo);
 
 
@@ -446,9 +442,7 @@ void handleClient(SOCKET clientSocket)
              << "] Connection to destination FAILED"
              << endl;
 
-
         closesocket(destinationSocket);
-
         closesocket(clientSocket);
 
         return;
@@ -459,260 +453,218 @@ void handleClient(SOCKET clientSocket)
          << "] Successfully connected to destination!"
          << endl;
 
-         // =================================================
-// FORWARD ORIGINAL REQUEST TO DESTINATION SERVER
-// =================================================
 
-cout << "\n[WORKER " << threadId
-     << "] Forwarding request to destination..."
-     << endl;
+    // =================================================
+    // FORWARD ORIGINAL REQUEST TO DESTINATION
+    // =================================================
 
-
-// buffer contains the original request received from client
-// bytesReceived tells us how many bytes were actually received
-
-int totalSent = 0;
+    cout << "\n[WORKER " << threadId
+         << "] Forwarding request to destination..."
+         << endl;
 
 
-while (totalSent < bytesReceived)
-{
-    int bytesSentToServer = send(
-
-        destinationSocket,
-
-        buffer + totalSent,
-
-        bytesReceived - totalSent,
-
-        0
-
-    );
+    int totalSent = 0;
 
 
-    if (bytesSentToServer == SOCKET_ERROR)
+    while (totalSent < bytesReceived)
     {
-        cout << "[WORKER " << threadId
-             << "] Failed to forward request to destination"
-             << endl;
+        int bytesSentToServer = send(
+            destinationSocket,
+            buffer + totalSent,
+            bytesReceived - totalSent,
+            0
+        );
 
 
-        closesocket(destinationSocket);
-        closesocket(clientSocket);
+        if (
+            bytesSentToServer == SOCKET_ERROR ||
+            bytesSentToServer == 0
+        )
+        {
+            cout << "[WORKER " << threadId
+                 << "] Failed to forward request"
+                 << endl;
 
-        return;
-    }
+            closesocket(destinationSocket);
+            closesocket(clientSocket);
 
-
-    totalSent += bytesSentToServer;
-}
-
-
-cout << "[WORKER " << threadId
-     << "] Request successfully forwarded!"
-     << endl;
-
-
-     // =================================================
-// RECEIVE RESPONSE FROM DESTINATION SERVER
-// AND FORWARD IT TO CLIENT
-// =================================================
-
-cout << "\n[WORKER " << threadId
-     << "] Waiting for response from destination..."
-     << endl;
+            return;
+        }
 
 
-// Buffer for chunks received from destination
-char responseBuffer[8192];
-
-
-while (true)
-{
-    // =============================================
-    // RECEIVE RESPONSE FROM DESTINATION SERVER
-    // =============================================
-
-    int bytesReceivedFromServer = recv(
-
-        destinationSocket,
-
-        responseBuffer,
-
-        sizeof(responseBuffer),
-
-        0
-
-    );
-
-
-    // Server closed connection
-    if (bytesReceivedFromServer == 0)
-    {
-        cout << "[WORKER " << threadId
-             << "] Destination server closed connection"
-             << endl;
-
-        break;
-    }
-
-
-    // Receive error
-    if (bytesReceivedFromServer == SOCKET_ERROR)
-    {
-        cout << "[WORKER " << threadId
-             << "] Error receiving response from destination"
-             << endl;
-
-        break;
+        totalSent += bytesSentToServer;
     }
 
 
     cout << "[WORKER " << threadId
-         << "] Received "
-         << bytesReceivedFromServer
-         << " bytes from destination"
+         << "] Request successfully forwarded!"
          << endl;
 
 
-    // =============================================
-    // FORWARD ENTIRE CHUNK TO CLIENT
-    // =============================================
+    // =================================================
+    // RECEIVE RESPONSE FROM DESTINATION
+    // AND FORWARD IT TO CLIENT
+    // =================================================
 
-    int totalSentToClient = 0;
+    cout << "\n[WORKER " << threadId
+         << "] Waiting for destination response..."
+         << endl;
 
 
-    while (totalSentToClient < bytesReceivedFromServer)
+    char responseBuffer[8192];
+
+
+    while (true)
     {
-        int bytesSentToClient = send(
+        // =============================================
+        // RECEIVE RESPONSE CHUNK
+        // =============================================
 
-            clientSocket,
-
-            responseBuffer + totalSentToClient,
-
-            bytesReceivedFromServer - totalSentToClient,
-
+        int bytesReceivedFromServer = recv(
+            destinationSocket,
+            responseBuffer,
+            sizeof(responseBuffer),
             0
-
         );
 
 
-        if (bytesSentToClient == SOCKET_ERROR)
+        // Destination closed connection.
+        if (bytesReceivedFromServer == 0)
         {
             cout << "[WORKER " << threadId
-                 << "] Failed to forward response to client"
+                 << "] Destination server closed connection"
                  << endl;
 
             break;
         }
 
 
-        totalSentToClient += bytesSentToClient;
+        if (bytesReceivedFromServer == SOCKET_ERROR)
+        {
+            cout << "[WORKER " << threadId
+                 << "] Error receiving response"
+                 << endl;
+
+            break;
+        }
+
+
+        cout << "[WORKER " << threadId
+             << "] Received "
+             << bytesReceivedFromServer
+             << " bytes from destination"
+             << endl;
+
+
+        // =============================================
+        // FORWARD ENTIRE RESPONSE CHUNK TO CLIENT
+        // =============================================
+
+        int totalSentToClient = 0;
+
+
+        while (
+            totalSentToClient <
+            bytesReceivedFromServer
+        )
+        {
+            int bytesSentToClient = send(
+                clientSocket,
+                responseBuffer + totalSentToClient,
+                bytesReceivedFromServer -
+                    totalSentToClient,
+                0
+            );
+
+
+            if (
+                bytesSentToClient == SOCKET_ERROR ||
+                bytesSentToClient == 0
+            )
+            {
+                cout << "[WORKER " << threadId
+                     << "] Failed to forward response to client"
+                     << endl;
+
+                break;
+            }
+
+
+            totalSentToClient +=
+                bytesSentToClient;
+        }
+
+
+        // Could not forward complete response.
+        if (
+            totalSentToClient <
+            bytesReceivedFromServer
+        )
+        {
+            cout << "[WORKER " << threadId
+                 << "] Response relay stopped"
+                 << endl;
+
+            break;
+        }
+
+
+        cout << "[WORKER " << threadId
+             << "] Response chunk forwarded to client"
+             << endl;
     }
 
 
-    cout << "[WORKER " << threadId
-         << "] Response chunk forwarded to client"
+    cout << "\n[WORKER " << threadId
+         << "] Response relay finished"
          << endl;
 
 
-    // If sending to client failed,
-    // stop receiving more data.
-    if (totalSentToClient < bytesReceivedFromServer)
-    {
-        break;
-    }
-}
-
-
-cout << "[WORKER " << threadId
-     << "] Response relay finished"
-     << endl;
-
     // =================================================
-    // CURRENT TEMPORARY RESPONSE
-    //
-    // Next step:
-    //
-    // send(destinationSocket, buffer, bytesReceived, 0)
-    //
-    // Then receive destination response.
-    // =================================================
-
-
-    const char* response =
-
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 21\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "Hello from AegisProxy";
-
-
-    int bytesSent = send(
-
-        clientSocket,
-        response,
-        strlen(response),
-        0
-
-    );
-
-
-    if (bytesSent == SOCKET_ERROR)
-    {
-        cout << "[WORKER " << threadId
-             << "] Response send failed"
-             << endl;
-    }
-    else
-    {
-        cout << "[WORKER " << threadId
-             << "] Temporary response sent to client"
-             << endl;
-    }
-
-
-    // =================================================
-    // CLEANUP CLIENT + DESTINATION
+    // CLEANUP
     // =================================================
 
     closesocket(
-
         destinationSocket
-
     );
-
-
-    cout << "[WORKER " << threadId
-         << "] Destination connection closed"
-         << endl;
 
 
     closesocket(
-
         clientSocket
-
     );
 
 
     cout << "[WORKER " << threadId
-         << "] Client connection closed"
+         << "] Client and destination connections closed"
          << endl;
 }
 
 
 // =====================================================
 // WORKER THREAD FUNCTION
+//
+// THESE THREADS ARE CREATED ONCE.
+//
+// Then they repeatedly:
+//
+// 1. Sleep waiting for work
+// 2. Wake when clientAvailable > 0
+// 3. Take one client from queue
+// 4. Free one queue slot
+// 5. Handle client
+// 6. Return to waiting
+//
+// This is our basic fixed thread pool.
 // =====================================================
 
 DWORD WINAPI workerFunction(LPVOID lpParam)
 {
-    DWORD threadId = GetCurrentThreadId();
+    DWORD threadId =
+        GetCurrentThreadId();
 
 
     cout << "[WORKER " << threadId
-         << "] Worker started and waiting for tasks"
+         << "] Started and waiting for tasks"
          << endl;
 
 
@@ -721,17 +673,15 @@ DWORD WINAPI workerFunction(LPVOID lpParam)
         // =============================================
         // WAIT FOR AVAILABLE CLIENT
         //
-        // If queue is empty:
-        // worker sleeps.
+        // If count == 0:
+        // worker sleeps efficiently.
         //
         // No busy waiting.
         // =============================================
 
         WaitForSingleObject(
-
             clientAvailable,
             INFINITE
-
         );
 
 
@@ -740,46 +690,20 @@ DWORD WINAPI workerFunction(LPVOID lpParam)
         // =============================================
 
         WaitForSingleObject(
-
             queueMutex,
             INFINITE
-
         );
 
 
-        // Take one client from queue
-        SOCKET clientSocket =
+        // =============================================
+        // REMOVE ONE CLIENT FROM QUEUE
+        // =============================================
 
+        SOCKET clientSocket =
             clientQueue.front();
 
 
         clientQueue.pop();
-
-
-        // =============================================
-        // UNLOCK QUEUE
-        // =============================================
-
-        ReleaseMutex(
-
-            queueMutex
-
-        );
-
-
-        // =============================================
-        // ONE SLOT BECAME FREE
-        //
-        // Increase available queue slots
-        // =============================================
-
-        ReleaseSemaphore(
-
-            queueSlots,
-            1,
-            nullptr
-
-        );
 
 
         cout << "[WORKER " << threadId
@@ -787,12 +711,49 @@ DWORD WINAPI workerFunction(LPVOID lpParam)
              << endl;
 
 
-        // Handle outside mutex
-        handleClient(
+        cout << "[WORKER " << threadId
+             << "] Queue size after pop: "
+             << clientQueue.size()
+             << endl;
 
-            clientSocket
 
+        // =============================================
+        // UNLOCK QUEUE
+        //
+        // Queue is no longer being accessed.
+        // =============================================
+
+        ReleaseMutex(
+            queueMutex
         );
+
+
+        // =============================================
+        // ONE QUEUE SLOT IS NOW FREE
+        // =============================================
+
+        ReleaseSemaphore(
+            emptySlots,
+            1,
+            nullptr
+        );
+
+
+        // =============================================
+        // HANDLE CLIENT OUTSIDE MUTEX
+        //
+        // Other workers can access queue while this
+        // worker performs networking.
+        // =============================================
+
+        handleClient(
+            clientSocket
+        );
+
+
+        cout << "[WORKER " << threadId
+             << "] Finished task, returning to pool"
+             << endl;
     }
 
 
@@ -807,97 +768,15 @@ DWORD WINAPI workerFunction(LPVOID lpParam)
 int main()
 {
     // =================================================
-    // CREATE QUEUE MUTEX
-    // =================================================
-
-    queueMutex = CreateMutex(
-
-        nullptr,
-        FALSE,
-        nullptr
-
-    );
-
-
-    if (queueMutex == nullptr)
-    {
-        cout << "Failed to create queue mutex"
-             << endl;
-
-        return 1;
-    }
-
-
-    // =================================================
-    // CREATE CLIENT AVAILABLE SEMAPHORE
-    //
-    // Initially:
-    // Queue has 0 clients
-    // =================================================
-
-    clientAvailable = CreateSemaphore(
-
-        nullptr,
-        0,
-        MAX_QUEUE_SIZE,
-        nullptr
-
-    );
-
-
-    if (clientAvailable == nullptr)
-    {
-        cout << "Failed to create client semaphore"
-             << endl;
-
-        CloseHandle(queueMutex);
-
-        return 1;
-    }
-
-
-    // =================================================
-    // CREATE QUEUE SLOT SEMAPHORE
-    //
-    // Initially:
-    // All MAX_QUEUE_SIZE slots are available
-    // =================================================
-
-    queueSlots = CreateSemaphore(
-
-        nullptr,
-        MAX_QUEUE_SIZE,
-        MAX_QUEUE_SIZE,
-        nullptr
-
-    );
-
-
-    if (queueSlots == nullptr)
-    {
-        cout << "Failed to create queue slot semaphore"
-             << endl;
-
-        CloseHandle(queueMutex);
-
-        CloseHandle(clientAvailable);
-
-        return 1;
-    }
-
-
-    // =================================================
-    // INITIALIZE WINSOCK
+    // INITIALIZE WINSOCK FIRST
     // =================================================
 
     WSADATA wsaData;
 
 
     int result = WSAStartup(
-
         MAKEWORD(2, 2),
         &wsaData
-
     );
 
 
@@ -915,40 +794,83 @@ int main()
 
 
     // =================================================
-    // CREATE FIXED WORKER THREAD POOL
+    // CREATE MUTEX
     // =================================================
 
-    for (int i = 0; i < WORKER_COUNT; i++)
+    queueMutex = CreateMutex(
+        nullptr,
+        FALSE,
+        nullptr
+    );
+
+
+    if (queueMutex == nullptr)
     {
-        HANDLE workerThread = CreateThread(
+        cout << "Failed to create queue mutex"
+             << endl;
 
-            nullptr,
-            0,
-            workerFunction,
-            nullptr,
-            0,
-            nullptr
+        WSACleanup();
 
-        );
+        return 1;
+    }
 
 
-        if (workerThread == nullptr)
-        {
-            cout << "Failed to create worker "
-                 << i + 1
-                 << endl;
-        }
-        else
-        {
-            cout << "Created worker "
-                 << i + 1
-                 << endl;
+    // =================================================
+    // CREATE clientAvailable SEMAPHORE
+    //
+    // Initially queue has 0 clients.
+    // =================================================
+
+    clientAvailable = CreateSemaphore(
+        nullptr,
+        0,
+        MAX_QUEUE_SIZE,
+        nullptr
+    );
 
 
-            // Thread continues running.
-            // We just don't need the HANDLE anymore.
-            CloseHandle(workerThread);
-        }
+    if (clientAvailable == nullptr)
+    {
+        cout << "Failed to create client semaphore"
+             << endl;
+
+        CloseHandle(queueMutex);
+
+        WSACleanup();
+
+        return 1;
+    }
+
+
+    // =================================================
+    // CREATE emptySlots SEMAPHORE
+    //
+    // Initially entire queue is empty.
+    //
+    // Therefore:
+    //
+    // emptySlots = MAX_QUEUE_SIZE
+    // =================================================
+
+    emptySlots = CreateSemaphore(
+        nullptr,
+        MAX_QUEUE_SIZE,
+        MAX_QUEUE_SIZE,
+        nullptr
+    );
+
+
+    if (emptySlots == nullptr)
+    {
+        cout << "Failed to create empty slots semaphore"
+             << endl;
+
+        CloseHandle(clientAvailable);
+        CloseHandle(queueMutex);
+
+        WSACleanup();
+
+        return 1;
     }
 
 
@@ -957,11 +879,9 @@ int main()
     // =================================================
 
     SOCKET serverSocket = socket(
-
         AF_INET,
         SOCK_STREAM,
         IPPROTO_TCP
-
     );
 
 
@@ -969,6 +889,10 @@ int main()
     {
         cout << "Server socket creation failed"
              << endl;
+
+        CloseHandle(emptySlots);
+        CloseHandle(clientAvailable);
+        CloseHandle(queueMutex);
 
         WSACleanup();
 
@@ -981,17 +905,28 @@ int main()
 
 
     // =================================================
-    // CONFIGURE SERVER ADDRESS
+    // SERVER ADDRESS
     // =================================================
 
     sockaddr_in serverAddress;
 
+    memset(
+        &serverAddress,
+        0,
+        sizeof(serverAddress)
+    );
 
-    serverAddress.sin_family = AF_INET;
 
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_family =
+        AF_INET;
 
-    serverAddress.sin_port = htons(8080);
+
+    serverAddress.sin_addr.s_addr =
+        INADDR_ANY;
+
+
+    serverAddress.sin_port =
+        htons(8080);
 
 
     // =================================================
@@ -999,17 +934,11 @@ int main()
     // =================================================
 
     result = bind(
-
         serverSocket,
-
         reinterpret_cast<sockaddr*>(
-
             &serverAddress
-
         ),
-
         sizeof(serverAddress)
-
     );
 
 
@@ -1019,6 +948,10 @@ int main()
              << endl;
 
         closesocket(serverSocket);
+
+        CloseHandle(emptySlots);
+        CloseHandle(clientAvailable);
+        CloseHandle(queueMutex);
 
         WSACleanup();
 
@@ -1035,10 +968,8 @@ int main()
     // =================================================
 
     result = listen(
-
         serverSocket,
         SOMAXCONN
-
     );
 
 
@@ -1049,18 +980,85 @@ int main()
 
         closesocket(serverSocket);
 
+        CloseHandle(emptySlots);
+        CloseHandle(clientAvailable);
+        CloseHandle(queueMutex);
+
         WSACleanup();
 
         return 1;
     }
 
 
-    cout << "\nAegisProxy listening on port 8080"
+    cout << "AegisProxy listening on port 8080"
          << endl;
 
 
     // =================================================
+    // CREATE FIXED WORKER THREAD POOL
+    //
+    // Threads are created BEFORE clients arrive.
+    //
+    // They start immediately and sleep on
+    // clientAvailable semaphore until work arrives.
+    // =================================================
+
+    for (
+        int i = 0;
+        i < WORKER_COUNT;
+        i++
+    )
+    {
+        HANDLE workerThread = CreateThread(
+            nullptr,
+            0,
+            workerFunction,
+            nullptr,
+            0,
+            nullptr
+        );
+
+
+        if (workerThread == nullptr)
+        {
+            cout << "Failed to create worker "
+                 << i + 1
+                 << endl;
+        }
+        else
+        {
+            cout << "[MAIN] Worker "
+                 << i + 1
+                 << " created"
+                 << endl;
+
+
+            // Worker continues running even after
+            // its HANDLE is closed.
+            //
+            // We simply don't need the handle because
+            // worker runs forever.
+            CloseHandle(
+                workerThread
+            );
+        }
+    }
+
+
+    // =================================================
     // MAIN THREAD = PRODUCER
+    //
+    // Accept client
+    //        ↓
+    // Wait for empty queue slot
+    //        ↓
+    // Lock queue
+    //        ↓
+    // Push client
+    //        ↓
+    // Unlock queue
+    //        ↓
+    // Signal available client
     // =================================================
 
     while (true)
@@ -1070,17 +1068,15 @@ int main()
 
 
         SOCKET clientSocket = accept(
-
             serverSocket,
             nullptr,
             nullptr
-
         );
 
 
         if (clientSocket == INVALID_SOCKET)
         {
-            cout << "[MAIN] Accept failed"
+            cout << "[MAIN] accept() failed"
                  << endl;
 
             continue;
@@ -1092,17 +1088,17 @@ int main()
 
 
         // =============================================
-        // WAIT FOR FREE QUEUE SLOT
+        // WAIT FOR EMPTY QUEUE SLOT
         //
         // If queue is full:
-        // main thread sleeps efficiently.
+        // main thread sleeps here.
+        //
+        // No busy waiting.
         // =============================================
 
         WaitForSingleObject(
-
-            queueSlots,
+            emptySlots,
             INFINITE
-
         );
 
 
@@ -1111,22 +1107,26 @@ int main()
         // =============================================
 
         WaitForSingleObject(
-
             queueMutex,
             INFINITE
-
         );
 
 
-        // Add client socket to queue
+        // =============================================
+        // PUSH CLIENT INTO QUEUE
+        // =============================================
+
         clientQueue.push(
-
             clientSocket
-
         );
 
 
         cout << "[MAIN] Client added to queue"
+             << endl;
+
+
+        cout << "[MAIN] Queue size: "
+             << clientQueue.size()
              << endl;
 
 
@@ -1135,41 +1135,51 @@ int main()
         // =============================================
 
         ReleaseMutex(
-
             queueMutex
-
         );
 
 
         // =============================================
-        // SIGNAL AVAILABLE CLIENT
+        // SIGNAL THAT ONE CLIENT IS AVAILABLE
+        //
+        // This wakes one sleeping worker.
         // =============================================
 
         ReleaseSemaphore(
-
             clientAvailable,
             1,
             nullptr
-
         );
 
 
-        cout << "[MAIN] Worker notified"
+        cout << "[MAIN] One worker notified"
              << endl;
     }
 
 
-    // Normally unreachable
+    // Normally unreachable because server runs forever.
 
-    closesocket(serverSocket);
+    closesocket(
+        serverSocket
+    );
+
+
+    CloseHandle(
+        emptySlots
+    );
+
+
+    CloseHandle(
+        clientAvailable
+    );
+
+
+    CloseHandle(
+        queueMutex
+    );
+
 
     WSACleanup();
-
-    CloseHandle(queueMutex);
-
-    CloseHandle(clientAvailable);
-
-    CloseHandle(queueSlots);
 
 
     return 0;
